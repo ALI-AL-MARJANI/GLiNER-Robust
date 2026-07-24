@@ -57,16 +57,27 @@ class LstmSeq2SeqEncoder(nn.Module):
         Returns:
             Encoded output tensor of shape (batch_size, seq_len, hidden_size).
         """
-        # Packing the input sequence
         if lengths is None:
             lengths = mask.sum(dim=1).cpu()
-        packed_x = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+        lengths = torch.as_tensor(lengths)
 
-        # Passing packed sequence through LSTM
+        # enforce_sorted=True avoids the dynamic-rank If/NonZero control-flow
+        # nodes that pack_padded_sequence(..., enforce_sorted=False) emits on
+        # ONNX export -- OpenVINO's CPU plugin can't execute those (see
+        # docs/... conformal/M4 roadmap notes). Sorting manually and unsorting
+        # afterward is bit-for-bit identical to the enforce_sorted=False path
+        # (verified empirically: torch.equal on mixed-length batches), it just
+        # skips PyTorch's own internal dynamic sort.
+        sorted_lengths, sort_idx = torch.sort(lengths, descending=True)
+        unsort_idx = torch.argsort(sort_idx)
+
+        x_sorted = x.index_select(0, sort_idx.to(x.device))
+        packed_x = pack_padded_sequence(x_sorted, sorted_lengths, batch_first=True, enforce_sorted=True)
+
         packed_output, hidden = self.lstm(packed_x, hidden)
 
-        # Unpacking the output sequence
-        output, _ = pad_packed_sequence(packed_output, batch_first=True)
+        output_sorted, _ = pad_packed_sequence(packed_output, batch_first=True)
+        output = output_sorted.index_select(0, unsort_idx.to(output_sorted.device))
 
         return output
 
