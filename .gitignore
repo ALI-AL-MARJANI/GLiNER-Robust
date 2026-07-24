@@ -181,3 +181,15 @@ poetry.toml
 pyrightconfig.json
 
 .vscode
+
+# Local scratch / planning docs for this branch (feat/apple-silicon-serving) —
+# not part of any eventual PR diff. Also covers untracked leftovers from
+# this fork's other, unrelated branches that persist across checkout.
+/CLAUDE.md
+/M4_ROADMAP.md
+/ROADMAP.md
+/pruning_adr.md
+/docs/PR_DESCRIPTION.md
+/docs/archive/
+/docs/research/
+/results/

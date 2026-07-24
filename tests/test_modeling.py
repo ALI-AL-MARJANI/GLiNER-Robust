@@ -1,4 +1,4 @@
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 import pytest
@@ -794,6 +794,27 @@ class TestUniEncoderSpanModel:
         assert output.loss is None  # No loss without labels
         assert output.logits.shape[0] == B  # Batch dimension
         assert output.logits.shape[1] == L  # Sequence dimension
+
+    def test_forward_passes_adapter_ids_to_encoder(self, mock_config, model_inputs):
+        """Regression test: forward()'s encoder_kwargs whitelist must include
+        adapter_ids, or PolyLoRA serving silently runs the base model no matter
+        which adapter_id is requested (found while wiring PolyLoRA up for real
+        on gliner/serve)."""
+        model_inputs_no_labels = {k: v for k, v in model_inputs.items() if k != "labels"}
+        model = UniEncoderSpanModel(mock_config, from_pretrained=False)
+
+        captured_kwargs = {}
+        original = model.get_representations
+
+        def spy(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return original(*args, **kwargs)
+
+        with patch.object(model, "get_representations", side_effect=spy):
+            with torch.no_grad():
+                model(**model_inputs_no_labels, adapter_ids=["adapter_a", "adapter_a"])
+
+        assert captured_kwargs.get("adapter_ids") == ["adapter_a", "adapter_a"]
 
     def test_loss_computation(self, mock_config):
         """Should compute loss correctly with labels."""

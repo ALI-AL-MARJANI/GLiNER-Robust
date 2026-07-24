@@ -230,7 +230,8 @@ class GLiNERServer:
             resolved = [self.ensure_adapter_loaded(adapter_ids[idx]) for idx in valid_to_orig_idx]
             return resolved
         if adapter_ids is not None:
-            return self.ensure_adapter_loaded(adapter_ids)
+            resolved_id = self.ensure_adapter_loaded(adapter_ids)
+            return [resolved_id for _ in valid_to_orig_idx]
         if self.config.enable_polylora:
             return [self.config.polylora_base_adapter_id for _ in valid_to_orig_idx]
         return None

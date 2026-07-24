@@ -1,5 +1,6 @@
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+from gliner.serve.config import GLiNERServeConfig
 from gliner.serve.server import GLiNERServer, _min_batch_value, _normalize_relation_lists
 
 
@@ -39,6 +40,39 @@ class _FakeModel:
         for decoded_idx, original_idx in enumerate(valid_to_orig_idx):
             results[original_idx] = decoded[decoded_idx]
         return results
+
+
+def test_config_defaults_target_cuda_when_available():
+    with patch("torch.cuda.is_available", return_value=True):
+        config = GLiNERServeConfig(model="dummy")
+
+    assert config.device == "cuda"
+    assert config.num_gpus_per_replica == 1.0
+    assert config.polylora_use_triton_kernels is True
+
+
+def test_config_defaults_target_mps_when_no_cuda():
+    with (
+        patch("torch.cuda.is_available", return_value=False),
+        patch("torch.backends.mps.is_available", return_value=True),
+    ):
+        config = GLiNERServeConfig(model="dummy")
+
+    assert config.device == "mps"
+    assert config.num_gpus_per_replica == 0.0
+    assert config.polylora_use_triton_kernels is False
+
+
+def test_config_defaults_fall_back_to_cpu_without_cuda_or_mps():
+    with (
+        patch("torch.cuda.is_available", return_value=False),
+        patch("torch.backends.mps.is_available", return_value=False),
+    ):
+        config = GLiNERServeConfig(model="dummy")
+
+    assert config.device == "cpu"
+    assert config.num_gpus_per_replica == 0.0
+    assert config.polylora_use_triton_kernels is False
 
 
 def test_min_batch_value_uses_lowest_threshold_for_model_pruning():
@@ -109,6 +143,19 @@ def test_resolve_adapter_ids_uses_base_adapter_for_empty_request_ids():
     server.config = Mock(enable_polylora=True, polylora_base_adapter_id="__base__")
 
     assert server._resolve_adapter_ids([None, "task-a", None], [0, 2]) == ["__base__", "__base__"]
+
+
+def test_resolve_adapter_ids_broadcasts_single_adapter_id_across_batch():
+    """Regression test: predict()'s single `adapter_id=str` convenience path must
+    broadcast into a per-item list matching batch size, not return a bare string —
+    a bare string is iterable, so downstream `len(adapter_ids) != batch_size`
+    checks silently misbehave instead of applying the requested adapter (found
+    while wiring PolyLoRA up for real on gliner/serve)."""
+    server = GLiNERServer.__new__(GLiNERServer)
+    server.config = Mock(enable_polylora=True, polylora_base_adapter_id="__base__")
+    server.ensure_adapter_loaded = lambda adapter_id: adapter_id
+
+    assert server._resolve_adapter_ids("task-a", [0, 1, 2]) == ["task-a", "task-a", "task-a"]
 
 
 def test_run_batch_ner_passes_valid_text_adapter_ids():

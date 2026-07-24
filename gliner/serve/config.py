@@ -3,6 +3,32 @@
 from typing import List, Optional
 from dataclasses import field, dataclass
 
+import torch
+
+
+def _default_device() -> str:
+    """"cuda" when available, else "mps" on Apple Silicon, else "cpu"."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _default_num_gpus_per_replica() -> float:
+    """0.0 without CUDA.
+
+    Ray only tracks CUDA as the "GPU" resource; requesting a GPU slot on a
+    machine Ray sees as GPU-less (e.g. Apple Silicon/MPS) leaves the actor
+    unschedulable forever instead of erroring.
+    """
+    return 1.0 if torch.cuda.is_available() else 0.0
+
+
+def _default_polylora_use_triton_kernels() -> bool:
+    """Triton has no working Apple GPU/Metal backend."""
+    return torch.cuda.is_available()
+
 
 @dataclass
 class GLiNERServeConfig:
@@ -13,7 +39,7 @@ class GLiNERServeConfig:
     """
 
     model: str
-    device: str = "cuda"
+    device: str = field(default_factory=_default_device)
     dtype: str = "bfloat16"
 
     quantization: Optional[str] = None
@@ -26,7 +52,7 @@ class GLiNERServeConfig:
     default_relation_threshold: float = 0.5
 
     num_replicas: int = 1
-    num_gpus_per_replica: float = 1.0
+    num_gpus_per_replica: float = field(default_factory=_default_num_gpus_per_replica)
     num_cpus_per_replica: float = 1.0
 
     max_batch_size: int = 32
@@ -66,7 +92,7 @@ class GLiNERServeConfig:
     polylora_disk_cache_dir: Optional[str] = None
     polylora_max_disk_adapters: Optional[int] = None
     polylora_base_adapter_id: str = "__base__"
-    polylora_use_triton_kernels: bool = True
+    polylora_use_triton_kernels: bool = field(default_factory=_default_polylora_use_triton_kernels)
     polylora_adapter_id_pattern: str = r"^[A-Za-z0-9_.-]{1,128}$"
 
     def __post_init__(self):
