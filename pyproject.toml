@@ -65,6 +65,17 @@ stanza = [
 serve = [
     "ray[serve]>=2.9.0",
 ]
+# Reproduces results/ (scripts/*.py, experiments/), Python >= 3.11. Exact versions used for the committed results.
+experiments = [
+    "accelerate==1.14.0; python_version >= '3.11'",
+    "onnx==1.22.0; python_version >= '3.11'",
+    "onnxruntime==1.24.4; python_version >= '3.11'",
+    "openvino==2026.2.1; python_version >= '3.11'",
+    "nncf==3.2.0; python_version >= '3.11'",
+    "matplotlib==3.10.9; python_version >= '3.11'",
+    "pyyaml==6.0.3; python_version >= '3.11'",
+    "psutil==7.2.2; python_version >= '3.11'",
+]
 
 [dependency-groups]
 # version pins are in uv.lock
@@ -228,13 +239,16 @@ extend-safe-fixes = [
     "PLR2004", # Magic values are fine in tests
     "S101",   # Assert is expected in tests
 ]
+"scripts/**/*.py" = [
+    "T201",   # CLI entry points report progress with print
+]
 
 [tool.ruff.lint.isort]
 length-sort = true
 length-sort-straight = true
 combine-as-imports = true
 extra-standard-library = ["typing_extensions"]
-known-first-party = ["gliner"]
+known-first-party = ["gliner", "experiments"]
 section-order = [
     "future",
     "standard-library",

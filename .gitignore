@@ -10,6 +10,8 @@ __pycache__/
 
 #data
 data.json
+# benchmark files downloaded by experiments/data.py (checksummed, re-downloaded on demand)
+data/raw/
 
 #logs
 logs/
@@ -27,7 +29,7 @@ eggs/
 .eggs/
 lib/
 lib64/
-parts/``
+parts/
 sdist/
 var/
 wheels/

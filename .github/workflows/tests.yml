@@ -43,7 +43,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-asyncio sentencepiece onnxruntime
+          pip install pytest pytest-asyncio sentencepiece onnxruntime onnx
 
       - name: Run pytest
         run: pytest -q --tb=short
@@ -61,7 +61,11 @@ jobs:
           python-version: "3.12"
 
       - name: Install ruff
-        run: pip install ruff
+        run: pip install ruff==0.15.11
 
       - name: ruff check
-        run: ruff check gliner
+        run: >-
+          ruff check gliner experiments
+          scripts/train_ablation.py scripts/analyze_ablation.py scripts/bench_deploy.py
+          scripts/eval_zero_shot.py scripts/span_imbalance.py scripts/make_figures.py
+          tests/test_span_losses.py tests/test_experiments.py tests/test_deploy.py
