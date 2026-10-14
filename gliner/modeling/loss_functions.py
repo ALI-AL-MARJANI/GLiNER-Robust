@@ -171,3 +171,110 @@ def cross_entropy_loss(
     )
 
     return loss
+
+
+def span_width_weights(
+    num_positions: int,
+    max_width: int,
+    device: torch.device = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Per-position weights ``w(k) = 1 + ln(k)`` for flattened span candidates.
+
+    Span models enumerate candidates as ``(start, width)`` pairs flattened to
+    ``start * max_width + (width - 1)``, so the width of position ``i`` is
+    ``i % max_width + 1``. Single-word spans get weight 1; a 12-word span gets
+    ``1 + ln(12) ≈ 3.48``.
+
+    This is a heuristic, not a published method: long entities are rarer than
+    short ones, so their positive pairs are up-weighted. It is meant to be
+    applied to positive pairs only (see :func:`apply_positive_weights`),
+    because long candidates are overwhelmingly negatives.
+
+    Args:
+        num_positions (int): Number of flattened span positions (``L * K``).
+        max_width (int): Maximum span width ``K`` used by the model.
+        device (torch.device, optional): Device of the returned tensor.
+        dtype (torch.dtype, optional): Dtype of the returned tensor.
+
+    Returns:
+        torch.Tensor: Weights of shape ``(num_positions,)``.
+    """
+    widths = torch.arange(num_positions, device=device) % max_width + 1
+    return 1.0 + torch.log(widths.to(dtype))
+
+
+def apply_positive_weights(losses: torch.Tensor, targets: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """Scale the loss of positive pairs by ``weights``; negatives keep weight 1.
+
+    Args:
+        losses (torch.Tensor): Element-wise losses of shape ``(B, N, C)``.
+        targets (torch.Tensor): Binary targets with the same shape.
+        weights (torch.Tensor): Per-position weights of shape ``(N,)``.
+
+    Returns:
+        torch.Tensor: Re-weighted losses with the same shape as ``losses``.
+    """
+    w = weights.view(1, -1, 1)
+    return losses * (1.0 + targets * (w - 1.0))
+
+
+def span_dice_loss(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+    alpha: float = 1.0,
+    smooth: float = 1.0,
+    square_denominator: bool = False,
+    pos_weights: torch.Tensor = None,
+) -> torch.Tensor:
+    """Self-adjusting Dice loss over all valid (span, type) pairs of a batch.
+
+    Follows the set-level formulation of the official implementation of
+    Li et al., "Dice Loss for Data-imbalanced NLP Tasks" (ACL 2020,
+    https://github.com/ShannonAI/dice_loss_for_NLP): probabilities are
+    modulated by ``(1 - p)^alpha`` and a single Dice coefficient is computed
+    over the whole batch::
+
+        p~   = (1 - p)^alpha * p
+        loss = 1 - (2 * sum(w * p~ * y) + smooth) / (sum(w * p~) + sum(w * y) + smooth)
+
+    where ``w`` is 1 for every pair unless ``pos_weights`` is given, in which
+    case positive pairs are weighted by their span position weight.
+
+    Unlike BCE/focal with ``reduction="sum"``, the result lies in ``[0, 1]``
+    and does not scale with the number of candidates.
+
+    Args:
+        inputs (torch.Tensor): Logits of shape ``(B, N, C)``.
+        targets (torch.Tensor): Binary targets of shape ``(B, N, C)``.
+        valid_mask (torch.Tensor): 1 for pairs that contribute (real span and
+            real entity type), 0 for padding. Shape ``(B, N, C)``.
+        alpha (float, optional): Self-adjusting exponent. ``0`` gives the plain
+            soft Dice loss. Defaults to 1.0.
+        smooth (float, optional): Additive smoothing (``gamma`` in the paper).
+            Defaults to 1.0.
+        square_denominator (bool, optional): Use squared terms in the
+            denominator (V-Net variant). Defaults to False.
+        pos_weights (torch.Tensor, optional): Per-position weights of shape
+            ``(N,)`` applied to positive pairs. Defaults to None.
+
+    Returns:
+        torch.Tensor: Scalar loss.
+    """
+    p = torch.sigmoid(inputs)
+    y = targets.to(p.dtype)
+    m = valid_mask.to(p.dtype)
+
+    if pos_weights is not None:
+        m = m * (1.0 + y * (pos_weights.view(1, -1, 1).to(p.dtype) - 1.0))
+
+    p_mod = ((1.0 - p) ** alpha) * p if alpha > 0 else p
+
+    intersection = (m * p_mod * y).sum()
+    if square_denominator:
+        denominator = (m * p_mod * p_mod).sum() + (m * y * y).sum()
+    else:
+        denominator = (m * p_mod).sum() + (m * y).sum()
+
+    return 1.0 - (2.0 * intersection + smooth) / (denominator + smooth)

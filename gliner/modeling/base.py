@@ -39,7 +39,13 @@ from .encoder import Encoder, BiEncoder
 from .outputs import GLiNERBaseOutput, GLiNERRelexOutput, GLiNERDecoderOutput
 from .scorers import Scorer
 from .span_rep import SpanRepLayer
-from .loss_functions import cross_entropy_loss, focal_loss_with_logits
+from .loss_functions import (
+    span_dice_loss,
+    cross_entropy_loss,
+    span_width_weights,
+    apply_positive_weights,
+    focal_loss_with_logits,
+)
 from .multitask.triples_layers import TriplesScoreLayer
 from .multitask.relations_layers import RelationsRepLayer
 
@@ -240,6 +246,94 @@ class BaseModel(ABC, nn.Module):
         all_losses = all_losses * mask_neg
 
         return all_losses
+
+    def _span_loss(
+        self,
+        scores: torch.Tensor,
+        labels: torch.Tensor,
+        prompts_embedding_mask: torch.Tensor,
+        span_mask: torch.Tensor,
+        alpha: float = -1.0,
+        gamma: float = 0.0,
+        prob_margin: float = 0.0,
+        label_smoothing: float = 0.0,
+        reduction: str = "sum",
+        negatives: float = 1.0,
+        masking: str = "none",
+        loss_type: str = "focal",
+        dice_alpha: float = 1.0,
+        dice_smooth: float = 1.0,
+        use_span_width_weight: bool = False,
+    ) -> torch.Tensor:
+        """Shared span classification loss for span-level models.
+
+        Args:
+            scores: Predicted scores of shape (B, L, K, C).
+            labels: Ground truth labels of shape (B, L, K, C).
+            prompts_embedding_mask: Mask for valid entity types of shape (B, C).
+            span_mask: Mask for valid spans of shape (B, L, K).
+            alpha: Focal loss alpha parameter (-1 disables class weighting).
+            gamma: Focal loss gamma parameter (0 disables focal modulation).
+            prob_margin: Margin for probability adjustment.
+            label_smoothing: Label smoothing factor.
+            reduction: Loss reduction method ('sum' or 'mean'), focal/BCE only.
+            negatives: Negative sampling probability, focal/BCE only.
+            masking: Masking strategy for negative sampling, focal/BCE only.
+            loss_type: "focal" (BCE when alpha=-1 and gamma=0) or "dice".
+            dice_alpha: Self-adjusting exponent of the Dice loss.
+            dice_smooth: Smoothing term of the Dice loss.
+            use_span_width_weight: Weight positive pairs by ``1 + ln(width)``.
+
+        Returns:
+            Scalar loss tensor.
+        """
+        BS, L, K, CL = scores.shape
+        num_classes = prompts_embedding_mask.shape[-1]
+
+        scores = scores.view(BS, -1, CL)
+        labels = labels.view(BS, -1, CL)
+        valid_mask = prompts_embedding_mask.view(BS, 1, num_classes).float() * span_mask.view(BS, -1, 1).float()
+
+        pos_weights = None
+        if use_span_width_weight:
+            pos_weights = span_width_weights(L * K, K, device=scores.device, dtype=scores.dtype)
+
+        if loss_type == "dice":
+            return span_dice_loss(
+                scores, labels, valid_mask, alpha=dice_alpha, smooth=dice_smooth, pos_weights=pos_weights
+            )
+        if loss_type != "focal":
+            raise ValueError(f"Unknown loss_type '{loss_type}'. Supported: 'focal', 'dice'.")
+
+        all_losses = self._loss(
+            scores,
+            labels,
+            alpha=alpha,
+            gamma=gamma,
+            prob_margin=prob_margin,
+            label_smoothing=label_smoothing,
+            negatives=negatives,
+            masking=masking,
+        )
+        if pos_weights is not None:
+            all_losses = apply_positive_weights(all_losses, labels, pos_weights)
+
+        all_losses = all_losses * valid_mask
+
+        if reduction == "mean":
+            num_valid = span_mask.float().sum()
+            loss = all_losses.sum() / num_valid if num_valid > 0 else torch.tensor(0.0, device=scores.device)
+        elif reduction == "sum":
+            loss = all_losses.sum()
+        else:
+            warnings.warn(
+                f"Invalid Value for config 'loss_reduction': '{reduction}' \n Supported reduction modes:"
+                f" 'none', 'mean', 'sum'. It will be used 'sum' instead.",
+                stacklevel=2,
+            )
+            loss = all_losses.sum()
+
+        return loss
 
     @abstractmethod
     def loss(self, x: Any) -> torch.Tensor:
@@ -500,6 +594,10 @@ class UniEncoderSpanModel(BaseUniEncoderModel):
         reduction: str = "sum",
         negatives: float = 1.0,
         masking: str = "none",
+        loss_type: str = "focal",
+        dice_alpha: float = 1.0,
+        dice_smooth: float = 1.0,
+        use_span_width_weight: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Compute span classification loss.
@@ -516,45 +614,32 @@ class UniEncoderSpanModel(BaseUniEncoderModel):
             reduction: Loss reduction method ('sum' or 'mean').
             negatives: Negative sampling probability.
             masking: Masking strategy for negative sampling.
+            loss_type: "focal" (BCE when alpha=-1 and gamma=0) or "dice".
+            dice_alpha: Self-adjusting exponent of the Dice loss.
+            dice_smooth: Smoothing term of the Dice loss.
+            use_span_width_weight: Weight positive pairs by ``1 + ln(width)``.
             **kwargs: Additional arguments.
 
         Returns:
             Scalar loss tensor.
         """
-        batch_size = scores.shape[0]
-        num_classes = prompts_embedding_mask.shape[-1]
-
-        # Reshape scores and labels to match the expected shape
-        BS, _, _, CL = scores.shape
-
-        scores = scores.view(BS, -1, CL)
-        labels = labels.view(BS, -1, CL)
-
-        all_losses = self._loss(
-            scores, labels, alpha, gamma, prob_margin, label_smoothing, negatives=negatives, masking=masking
+        return self._span_loss(
+            scores,
+            labels,
+            prompts_embedding_mask,
+            span_mask,
+            alpha=alpha,
+            gamma=gamma,
+            prob_margin=prob_margin,
+            label_smoothing=label_smoothing,
+            reduction=reduction,
+            negatives=negatives,
+            masking=masking,
+            loss_type=loss_type,
+            dice_alpha=dice_alpha,
+            dice_smooth=dice_smooth,
+            use_span_width_weight=use_span_width_weight,
         )
-
-        masked_loss = all_losses.view(batch_size, -1, num_classes) * prompts_embedding_mask.unsqueeze(1)
-        all_losses = masked_loss.view(-1, num_classes)
-
-        span_mask = span_mask.view(-1, 1)
-
-        all_losses = all_losses * span_mask.float()
-
-        if reduction == "mean":
-            num_valid = span_mask.float().sum()
-            loss = all_losses.sum() / num_valid if num_valid > 0 else torch.tensor(0.0, device=scores.device)
-        elif reduction == "sum":
-            loss = all_losses.sum()
-        else:
-            warnings.warn(
-                f"Invalid Value for config 'loss_reduction': '{reduction}' \n Supported reduction modes:"
-                f" 'none', 'mean', 'sum'. It will be used 'sum' instead.",
-                stacklevel=2,
-            )
-            loss = all_losses.sum()
-
-        return loss
 
 
 class UniEncoderTokenModel(BaseUniEncoderModel):
@@ -1012,10 +1097,15 @@ class BiEncoderSpanModel(BaseBiEncoderModel):
         mask_label: torch.Tensor,
         alpha: float = -1.0,
         gamma: float = 0.0,
+        prob_margin: float = 0.0,
         label_smoothing: float = 0.0,
         reduction: str = "sum",
         negatives: float = 1.0,
         masking: str = "none",
+        loss_type: str = "focal",
+        dice_alpha: float = 1.0,
+        dice_smooth: float = 1.0,
+        use_span_width_weight: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Compute span classification loss for bi-encoder.
@@ -1027,47 +1117,37 @@ class BiEncoderSpanModel(BaseBiEncoderModel):
             mask_label: Mask for valid spans of shape (B, L, K).
             alpha: Focal loss alpha parameter.
             gamma: Focal loss gamma parameter.
+            prob_margin: Margin for probability adjustment.
             label_smoothing: Label smoothing factor.
             reduction: Loss reduction method ('sum' or 'mean').
             negatives: Negative sampling probability.
             masking: Masking strategy for negative sampling.
+            loss_type: "focal" (BCE when alpha=-1 and gamma=0) or "dice".
+            dice_alpha: Self-adjusting exponent of the Dice loss.
+            dice_smooth: Smoothing term of the Dice loss.
+            use_span_width_weight: Weight positive pairs by ``1 + ln(width)``.
             **kwargs: Additional arguments.
 
         Returns:
             Scalar loss tensor.
         """
-        batch_size = scores.shape[0]
-        num_classes = prompts_embedding_mask.shape[-1]
-
-        # Reshape scores and labels to match the expected shape
-        BS, _, _, CL = scores.shape
-
-        scores = scores.view(BS, -1, CL)
-        labels = labels.view(BS, -1, CL)
-
-        all_losses = self._loss(scores, labels, alpha, gamma, label_smoothing, negatives=negatives, masking=masking)
-
-        masked_loss = all_losses.view(batch_size, -1, num_classes) * prompts_embedding_mask.unsqueeze(1)
-        all_losses = masked_loss.view(-1, num_classes)
-
-        mask_label = mask_label.view(-1, 1)
-
-        all_losses = all_losses * mask_label.float()
-
-        if reduction == "mean":
-            num_valid = mask_label.float().sum()
-            loss = all_losses.sum() / num_valid if num_valid > 0 else torch.tensor(0.0, device=scores.device)
-        elif reduction == "sum":
-            loss = all_losses.sum()
-        else:
-            warnings.warn(
-                f"Invalid Value for config 'loss_reduction': '{reduction}' \n Supported reduction modes:"
-                f" 'none', 'mean', 'sum'. It will be used 'sum' instead.",
-                stacklevel=2,
-            )
-            loss = all_losses.sum()
-
-        return loss
+        return self._span_loss(
+            scores,
+            labels,
+            prompts_embedding_mask,
+            mask_label,
+            alpha=alpha,
+            gamma=gamma,
+            prob_margin=prob_margin,
+            label_smoothing=label_smoothing,
+            reduction=reduction,
+            negatives=negatives,
+            masking=masking,
+            loss_type=loss_type,
+            dice_alpha=dice_alpha,
+            dice_smooth=dice_smooth,
+            use_span_width_weight=use_span_width_weight,
+        )
 
 
 class BiEncoderTokenModel(BaseBiEncoderModel, UniEncoderTokenModel):

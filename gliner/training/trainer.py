@@ -70,6 +70,14 @@ class TrainingArguments(transformers.TrainingArguments):
         negatives: Ratio of negative samples to use. Defaults to 1.0.
         masking: Masking strategy for training ('global' or other strategies).
             Defaults to 'global'.
+        loss_type: Span classification loss, 'focal' (BCE when focal_loss_alpha=-1
+            and focal_loss_gamma=0) or 'dice' (self-adjusting Dice, Li et al. 2020).
+            Only span-level uni-/bi-encoder models support 'dice'. Defaults to 'focal'.
+        dice_alpha: Self-adjusting exponent of the Dice loss. Defaults to 1.0.
+        dice_smooth: Smoothing term of the Dice loss. Defaults to 1.0.
+        use_span_width_weight: Weight positive (span, type) pairs by
+            ``1 + ln(width)``. Span-level uni-/bi-encoder models only.
+            Defaults to False.
     """
 
     cache_dir: Optional[str] = field(default=None)
@@ -85,6 +93,15 @@ class TrainingArguments(transformers.TrainingArguments):
     loss_reduction: Optional[str] = "sum"
     negatives: Optional[float] = 1.0
     masking: Optional[str] = "global"
+    loss_type: str = "focal"
+    dice_alpha: float = 1.0
+    dice_smooth: float = 1.0
+    use_span_width_weight: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.loss_type not in ("focal", "dice"):
+            raise ValueError(f"loss_type must be 'focal' or 'dice', got '{self.loss_type}'.")
 
 
 class Trainer(transformers.Trainer):
@@ -140,6 +157,33 @@ class Trainer(transformers.Trainer):
     def use_apex(self, value: bool) -> None:
         self._use_apex = bool(value)
 
+    def _extra_loss_kwargs(self, model) -> dict:
+        """Loss options that only span-level uni-/bi-encoder models understand.
+
+        Returns an empty dict when the defaults are used, so every other model
+        type keeps its exact upstream call signature. Raises when a non-default
+        option is requested for a model that would silently ignore it.
+        """
+        args = self.args
+        if args.loss_type == "focal" and not args.use_span_width_weight:
+            return {}
+
+        from ..modeling.base import BiEncoderSpanModel, UniEncoderSpanModel  # noqa: PLC0415
+
+        core = getattr(self.accelerator.unwrap_model(model), "model", None)
+        supported = (UniEncoderSpanModel.loss, BiEncoderSpanModel.loss)
+        if core is None or getattr(type(core), "loss", None) not in supported:
+            raise ValueError(
+                f"loss_type='{args.loss_type}' / use_span_width_weight={args.use_span_width_weight} "
+                f"is only implemented for UniEncoderSpanModel and BiEncoderSpanModel, got {type(core).__name__}."
+            )
+        return {
+            "loss_type": args.loss_type,
+            "dice_alpha": args.dice_alpha,
+            "dice_smooth": args.dice_smooth,
+            "use_span_width_weight": args.use_span_width_weight,
+        }
+
     def compute_loss(
         self,
         model,
@@ -164,6 +208,7 @@ class Trainer(transformers.Trainer):
             reduction=self.args.loss_reduction,
             negatives=self.args.negatives,
             masking=self.args.masking,
+            **self._extra_loss_kwargs(model),
             **inputs,
         )
 
