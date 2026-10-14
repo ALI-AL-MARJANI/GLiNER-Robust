@@ -27,7 +27,7 @@ models (temporary directory, deleted at the end).
 | Command | Hardware | Time | Output |
 |---|---|---|---|
 | `uv run python -m scripts.span_imbalance` | any CPU | < 10 s (measured) | `results/span_imbalance.json` |
-| `uv run python -m scripts.eval_zero_shot` | CPU, 8 threads | ~10 min on Apple M4 (measured) | `results/zero_shot/gliner_community_gliner_small_v2.5.json` |
+| `uv run python -m scripts.eval_zero_shot` | CPU, 8 threads | ~10 min on Apple M4 (measured; the first dataset alone takes ~1 min, do not interrupt) | `results/zero_shot/gliner_community_gliner_small_v2.5.json` |
 | `uv run python -m scripts.error_examples` | CPU | ~1 min (measured) | `results/zero_shot/error_examples.json` |
 
 Inference is deterministic. A re-run must reproduce the committed F1 values

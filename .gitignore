@@ -183,3 +183,9 @@ poetry.toml
 pyrightconfig.json
 
 .vscode
+# local OS / editor / assistant files (never part of the repository)
+.DS_Store
+.vscode/
+.idea/
+.claude/
+CLAUDE.md

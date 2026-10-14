@@ -37,14 +37,19 @@ def main() -> None:
 
     torch.set_num_threads(a.threads)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"loading {a.model} on {device} ...", flush=True)
     model = GLiNER.from_pretrained(a.model, revision=a.revision).to(device).eval()
 
     results = {}
     for name in a.datasets:
+        print(f"evaluating {name} ...", flush=True)
         r = evaluate_dataset(model, name, threshold=a.threshold, batch_size=a.batch_size)
         results[name] = r
         ci = r["f1_bootstrap"]
-        print(f"{name:22s} F1={100 * r['f1']:6.2f}  95% CI [{100 * ci['ci95_low']:.2f}, {100 * ci['ci95_high']:.2f}]")
+        print(
+            f"{name:22s} F1={100 * r['f1']:6.2f}  95% CI [{100 * ci['ci95_low']:.2f}, {100 * ci['ci95_high']:.2f}]",
+            flush=True,
+        )
     zs = [n for n in a.datasets if n in ZERO_SHOT_BENCHMARKS]
     avg = float(np.mean([results[n]["f1"] for n in zs])) if zs else None
     if avg is not None:
