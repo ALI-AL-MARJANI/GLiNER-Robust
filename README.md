@@ -21,10 +21,21 @@ A fork of [GLiNER](https://github.com/urchade/GLiNER) that adds span-level losse
 
 Setup: `gliner-community/gliner_small-v2.5` @ `f227d3c`, no fine-tuning, threshold 0.5, flat NER, Apple M4 CPU (env block in the JSON). Deterministic inference, single run; intervals come from resampling test sentences.
 
+**CPU deployment of the same checkpoint** (`results/deploy/apple-m4/summary.md`, generated from `results.json`):
+
+| Backend | Size (MB) | Avg F1, 8 sets (%) | ΔF1 vs PyTorch [95% CI] | p50 latency, 64 words, batch 1 (ms) |
+|---|---:|---:|---|---:|
+| PyTorch FP32 | 633 | 57.59 | — | 41.3 |
+| ONNX Runtime INT8 dynamic | 188 | 55.30 | −2.29 [−2.94, −1.66] | 25.6 (1.62× faster) |
+| OpenVINO INT8 weight-only | 188 | 57.54 | −0.05 [−0.16, +0.05] | 87.6 (2.1× slower) |
+| OpenVINO INT8 static (W+A) | 178 | 0.68 | −56.91 | 60.4 |
+
+Setup: Apple M4 (16 GB), 4 threads, 10 warmup + 50 timed end-to-end calls; all six backends and input lengths in [CPU deployment](#cpu-deployment).
+
 | Study | Status |
 |---|---|
 | Loss ablation (7 variants × 5 seeds, fine-tune on CoNLL-2003, evaluate on the 8 sets above) | **TBD (run pending)**. Code, config and statistics are in place; see [RUNBOOK.md](RUNBOOK.md#2-loss-ablation). |
-| CPU deployment (6 backends: F1, p50/p90 latency, size) | **TBD (run pending)**. See [RUNBOOK.md](RUNBOOK.md#3-cpu-deployment-benchmark). |
+| CPU deployment on an Intel CPU (OpenVINO's target hardware) | **TBD (run pending)**. See [RUNBOOK.md](RUNBOOK.md#3-cpu-deployment-benchmark). |
 
 ## What this fork adds
 
@@ -36,7 +47,7 @@ Everything else is upstream GLiNER at commit `dfc0061` (see `git log`).
 | `gliner/modeling/base.py` | `BaseModel._span_loss`: shared span loss for `UniEncoderSpanModel` and `BiEncoderSpanModel`, with `loss_type`, Dice and width-weighting options. Also fixes an upstream bug where `BiEncoderSpanModel.loss` passed `label_smoothing` positionally into `prob_margin`. |
 | `gliner/training/trainer.py` | `TrainingArguments.loss_type / dice_alpha / dice_smooth / use_span_width_weight` (defaults reproduce upstream exactly); the trainer refuses these options for model types that would silently ignore them |
 | `experiments/` | Dataset download with pinned revisions and SHA-256 checks, BIO parsing, entity-level F1, bootstrap / paired bootstrap / Holm correction, run metadata, deployment backends |
-| `scripts/` | `eval_zero_shot.py`, `span_imbalance.py`, `train_ablation.py`, `analyze_ablation.py`, `bench_deploy.py`, `error_examples.py`, `make_figures.py` |
+| `scripts/` | `eval_zero_shot.py`, `span_imbalance.py`, `train_ablation.py`, `analyze_ablation.py`, `bench_deploy.py`, `analyze_deploy.py`, `error_examples.py`, `make_figures.py` |
 | `configs/experiments/` | `ablation.yaml`, `deploy.yaml`: every hyperparameter used by the scripts |
 | `tests/test_span_losses.py`, `tests/test_experiments.py`, `tests/test_deploy.py` | 35 fast tests (CPU, no download) |
 | `results/` | Raw JSON outputs; figures are generated from them by `scripts/make_figures.py` |
@@ -130,7 +141,26 @@ TBD (run pending). `scripts/analyze_ablation.py` will write `results/ablation/su
 
 ### CPU deployment
 
-TBD (run pending). Output: `results/deploy/<cpu>/results.json`, `results/figures/deploy_pareto_<cpu>.png`, `results/figures/deploy_latency_<cpu>.png`.
+Apple M4, 16 GB, 4 threads, `gliner_small-v2.5` (`results/deploy/apple-m4/summary.md`). p50 end-to-end latency in ms (collate + forward + decode), with the speed-up relative to PyTorch FP32 in parentheses. Inputs have exactly N words; "b" is the batch size. ΔF1 is the difference of the 8-dataset average F1 from PyTorch, with a paired bootstrap 95% CI over test sentences.
+
+| Backend | Size (MB) | Avg F1 (%) | ΔF1 [95% CI] | 16 w, b1 | 16 w, b8 | 64 w, b1 | 64 w, b8 | 256 w, b1 | 256 w, b8 |
+|---|---:|---:|---|---:|---:|---:|---:|---:|---:|
+| pytorch_fp32 | 633 | 57.59 | — | 26.2 | 88.0 | 41.3 | 219.8 | 115.5 | 1188.3 |
+| onnx_fp32 | 634 | 57.59 | +0.00 [+0.00, +0.01] | 19.1 (1.37×) | 117.4 (0.75×) | 41.5 (1.00×) | 295.6 (0.74×) | 136.1 (0.85×) | 1372.5 (0.87×) |
+| onnx_int8_dynamic | 188 | 55.30 | −2.29 [−2.94, −1.66] | 9.2 (2.84×) | 69.2 (1.27×) | 25.6 (1.62×) | 197.6 (1.11×) | 94.0 (1.23×) | 1043.9 (1.14×) |
+| openvino_fp32 | 650 | 57.59 | +0.01 [−0.01, +0.03] | 31.6 (0.83×) | 201.2 (0.44×) | 89.0 (0.46×) | 665.0 (0.33×) | 348.7 (0.33×) | 3162.1 (0.38×) |
+| openvino_int8_weights | 188 | 57.54 | −0.05 [−0.16, +0.05] | 30.8 (0.85×) | 199.3 (0.44×) | 87.6 (0.47×) | 632.0 (0.35×) | 335.5 (0.34×) | 3148.3 (0.38×) |
+| openvino_int8_static | 178 | 0.68 | −56.91 [−57.72, −56.11] | 18.0 (1.45×) | 102.4 (0.86×) | 60.4 (0.68×) | 405.2 (0.54×) | 452.9 (0.26×) | 3644.1 (0.33×) |
+
+![Accuracy vs latency](results/figures/deploy_pareto_apple-m4.png)
+
+**Analysis.**
+
+- **Export correctness.** After the export fix, the FP32 backends (ONNX Runtime, OpenVINO) reproduce PyTorch: average F1 is identical to 0.01 points.
+- **ONNX Runtime dynamic INT8** is the only backend that is faster than PyTorch at every input length on this machine: 2.84× at 16 words and 1.62× at 64 words, falling to 1.1–1.3× at 256 words or batch 8, where non-quantized operations dominate. It is also 3.4× smaller. It costs 2.29 F1 points on average, and the loss is significant. The loss is uneven across datasets: in the per-dataset results (`results.json`), MIT Restaurant and MIT Movie drop by about 9 and 7 points, while CrossNER politics gains about 4.
+- **OpenVINO weight-only INT8** (`nncf.compress_weights`) is 3.4× smaller with no measurable F1 change (CI includes 0). On Apple silicon, however, every OpenVINO backend is slower than PyTorch: 1.2× slower at 16 words and 2.1–3× slower at 64 words and above. OpenVINO's CPU plugin is optimized for x86, so this result says nothing about Intel CPUs.
+- **OpenVINO static INT8** (`nncf.quantize`, weights and activations) collapses: predicted span probabilities differ from PyTorch by up to 1.0. Keeping the span/prompt heads, the LSTM and the scoring einsum in FP32 does not fix it (`RUNBOOK.md`). The root cause is not established.
+- **Batching.** With ONNX Runtime FP32, batch 8 is slower than PyTorch, while batch 1 at short inputs is faster. For short single queries, ONNX Runtime's lower per-call overhead matters most.
 
 ## Limitations and threats to validity
 
@@ -139,14 +169,14 @@ TBD (run pending). Output: `results/deploy/<cpu>/results.json`, `results/figures
 - **Label verbalization is ours.** Changing a prompt string (e.g. "miscellaneous") changes F1. Absolute numbers are therefore not comparable to published tables.
 - **Selection uses CoNLL-2003 dev only.** No target-domain data is used for checkpoint or threshold selection. That is the intended zero-shot setting, but the selected threshold may be far from optimal on a target domain.
 - **Scale of the losses.** Upstream sums BCE over pairs (`loss_reduction: sum`), whereas Dice lies in [0, 1]. With AdamW and gradient clipping at 10 the effective step size differs between variants. No per-variant learning-rate search was run.
-- **Latency.** Results apply to the measured CPU only. OpenVINO is designed for Intel CPUs, so numbers from Apple silicon do not transfer.
+- **Latency.** Results apply to the measured CPU only (Apple M4). OpenVINO is designed for Intel CPUs, so these numbers say nothing about OpenVINO on x86. Latency is the median of 50 calls in a single session, which does not capture run-to-run variance across reboots.
 
 ## Reproduce
 
 Commands, expected run time and hardware for every table are in [RUNBOOK.md](RUNBOOK.md):
 - **Zero-shot baseline:** about 10 minutes on an Apple M4 CPU.
 - **Loss ablation:** 35 fine-tuning runs, GPU recommended.
-- **CPU benchmark:** about 1 hour per machine.
+- **CPU benchmark:** 44 minutes on an Apple M4.
 
 ```bash
 uv sync --extra experiments --extra training --group dev   # Python >= 3.11

@@ -78,8 +78,9 @@ Each file is ~0.5 MB; no checkpoints are saved.
 # pipeline check (~10 min): 2 datasets x 50 sentences, 5 repetitions -> results/deploy/<cpu>-quick/
 uv run python -m scripts.bench_deploy --quick --output_dir /tmp/deploy_check
 
-# full run (~1 h on Apple M4, est.)
+# full run (44 min on Apple M4, measured)
 uv run python -m scripts.bench_deploy --config configs/experiments/deploy.yaml
+uv run python -m scripts.analyze_deploy --run_dir results/deploy/apple-m4   # ~1 min, deltas + speed-ups
 uv run python -m scripts.make_figures
 ```
 
