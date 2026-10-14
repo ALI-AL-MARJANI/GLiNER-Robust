@@ -43,7 +43,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-asyncio sentencepiece onnxruntime onnx
+          pip install pytest pytest-asyncio sentencepiece onnxruntime onnx accelerate
 
       - name: Run pytest
         run: pytest -q --tb=short
