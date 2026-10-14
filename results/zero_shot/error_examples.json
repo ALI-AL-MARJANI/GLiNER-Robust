@@ -1,0 +1,358 @@
+{
+ "model": "gliner-community/gliner_small-v2.5",
+ "revision": "f227d3cd637bd4e6757ae143935316d062393341",
+ "threshold": 0.5,
+ "datasets": {
+  "wnut17": {
+   "labels": [
+    "corporation",
+    "creative work",
+    "group",
+    "location",
+    "person",
+    "product"
+   ],
+   "examples": [
+    {
+     "index": 0,
+     "text": "& gt ; * The soldier was killed when another avalanche hit an army barracks in the northern area of Sonmarg , said a military spokesman .",
+     "gold": [
+      "Sonmarg [location]"
+     ],
+     "pred": [
+      "soldier [person]",
+      "Sonmarg [location]",
+      "military [group]"
+     ],
+     "false_positives": [
+      "soldier [person]",
+      "military [group]"
+     ],
+     "false_negatives": []
+    },
+    {
+     "index": 1,
+     "text": "& gt ; * Police last week evacuated 80 villagers from Waltengoo Nar where dozens were killed after a series of avalanches hit the area in 2005 in the south of the territory .",
+     "gold": [
+      "Waltengoo Nar [location]"
+     ],
+     "pred": [
+      "Police [group]",
+      "villagers [group]",
+      "Waltengoo Nar [location]"
+     ],
+     "false_positives": [
+      "Police [group]",
+      "villagers [group]"
+     ],
+     "false_negatives": []
+    },
+    {
+     "index": 2,
+     "text": "& gt ; * The army on Thursday recovered the bodies of ten of its men who were killed in an avalanche the previous day .",
+     "gold": [],
+     "pred": [
+      "army [group]"
+     ],
+     "false_positives": [
+      "army [group]"
+     ],
+     "false_negatives": []
+    },
+    {
+     "index": 4,
+     "text": "The bodies of the soldiers were recovered after the concerted efforts of the Avalanche Rescue Teams ( ART ) , which is equipped to work in inhospitable terrain and weather conditions .",
+     "gold": [
+      "Avalanche Rescue Teams [group]",
+      "ART [group]"
+     ],
+     "pred": [
+      "soldiers [person]",
+      "Avalanche Rescue Teams [group]",
+      "ART [creative work]"
+     ],
+     "false_positives": [
+      "soldiers [person]",
+      "ART [creative work]"
+     ],
+     "false_negatives": [
+      "ART [group]"
+     ]
+    },
+    {
+     "index": 5,
+     "text": "& gt ; * Arrangements are in place to carry the mortal remains of the martyrs to their native places immediately after weather becomes clear , Defence Spokesman Colonel Rajesh Kalia said .",
+     "gold": [
+      "Colonel Rajesh Kalia [person]"
+     ],
+     "pred": [
+      "martyrs [group]",
+      "Rajesh Kalia [person]"
+     ],
+     "false_positives": [
+      "martyrs [group]",
+      "Rajesh Kalia [person]"
+     ],
+     "false_negatives": [
+      "Colonel Rajesh Kalia [person]"
+     ]
+    }
+   ]
+  },
+  "crossner_ai": {
+   "labels": [
+    "algorithm",
+    "conference",
+    "country",
+    "field",
+    "location",
+    "metrics",
+    "miscellaneous",
+    "organization",
+    "person",
+    "product",
+    "programming language",
+    "researcher",
+    "task",
+    "university"
+   ],
+   "examples": [
+    {
+     "index": 0,
+     "text": "Typical generative model approaches include naive Bayes classifier s , Gaussian mixture model s , variational autoencoders and others .",
+     "gold": [
+      "naive Bayes classifier [algorithm]",
+      "Gaussian mixture model [algorithm]",
+      "variational autoencoders [algorithm]"
+     ],
+     "pred": [
+      "generative model [algorithm]",
+      "naive Bayes classifier s [algorithm]",
+      "Gaussian mixture model s [algorithm]",
+      "variational autoencoders [algorithm]"
+     ],
+     "false_positives": [
+      "generative model [algorithm]",
+      "naive Bayes classifier s [algorithm]",
+      "Gaussian mixture model s [algorithm]"
+     ],
+     "false_negatives": [
+      "naive Bayes classifier [algorithm]",
+      "Gaussian mixture model [algorithm]"
+     ]
+    },
+    {
+     "index": 1,
+     "text": "Finally , every other year , ELRA organizes a major conference LREC , the International Language Resources and Evaluation Conference .",
+     "gold": [
+      "ELRA [conference]",
+      "LREC [conference]",
+      "International Language Resources and Evaluation Conference [conference]"
+     ],
+     "pred": [
+      "ELRA [organization]",
+      "LREC [conference]",
+      "International Language Resources and Evaluation Conference [conference]"
+     ],
+     "false_positives": [
+      "ELRA [organization]"
+     ],
+     "false_negatives": [
+      "ELRA [conference]"
+     ]
+    },
+    {
+     "index": 2,
+     "text": "The task is usually to derive the maximum likelihood estimate of the parameters of the HMM given the of output sequences .",
+     "gold": [
+      "maximum likelihood estimate [algorithm]",
+      "HMM [algorithm]"
+     ],
+     "pred": [
+      "task [task]",
+      "maximum likelihood estimate [metrics]",
+      "parameters [metrics]",
+      "HMM [algorithm]"
+     ],
+     "false_positives": [
+      "task [task]",
+      "maximum likelihood estimate [metrics]",
+      "parameters [metrics]"
+     ],
+     "false_negatives": [
+      "maximum likelihood estimate [algorithm]"
+     ]
+    },
+    {
+     "index": 3,
+     "text": "Unlike neural network s and Support vector machine , the AdaBoost training process selects only those features known to improve the predictive power of the model , reducing dimensionality and potentially improving execution time as irrelevant features need not be computed .",
+     "gold": [
+      "neural network [algorithm]",
+      "Support vector machine [algorithm]",
+      "AdaBoost [algorithm]"
+     ],
+     "pred": [
+      "neural network s [algorithm]",
+      "Support vector machine [algorithm]",
+      "AdaBoost [algorithm]",
+      "training process [task]",
+      "predictive power [metrics]",
+      "model [miscellaneous]",
+      "dimensionality [metrics]"
+     ],
+     "false_positives": [
+      "neural network s [algorithm]",
+      "training process [task]",
+      "predictive power [metrics]",
+      "model [miscellaneous]",
+      "dimensionality [metrics]"
+     ],
+     "false_negatives": [
+      "neural network [algorithm]"
+     ]
+    },
+    {
+     "index": 4,
+     "text": "Troponymy is one of the possible relations between verb s in the semantic network of the WordNet database .",
+     "gold": [
+      "Troponymy [miscellaneous]",
+      "semantic network [miscellaneous]",
+      "WordNet database [product]"
+     ],
+     "pred": [
+      "Troponymy [miscellaneous]",
+      "verb s [miscellaneous]",
+      "semantic network [miscellaneous]",
+      "WordNet [programming language]"
+     ],
+     "false_positives": [
+      "verb s [miscellaneous]",
+      "WordNet [programming language]"
+     ],
+     "false_negatives": [
+      "WordNet database [product]"
+     ]
+    }
+   ]
+  },
+  "mit_movie": {
+   "labels": [
+    "actor",
+    "average ratings",
+    "character",
+    "director",
+    "genre",
+    "mpaa rating",
+    "plot",
+    "review",
+    "song",
+    "title",
+    "trailer",
+    "year"
+   ],
+   "examples": [
+    {
+     "index": 0,
+     "text": "are there any good romantic comedies out right now",
+     "gold": [
+      "romantic comedies [genre]",
+      "right now [year]"
+     ],
+     "pred": [
+      "romantic comedies [genre]"
+     ],
+     "false_positives": [],
+     "false_negatives": [
+      "right now [year]"
+     ]
+    },
+    {
+     "index": 1,
+     "text": "show me a movie about cars that talk",
+     "gold": [
+      "cars that talk [plot]"
+     ],
+     "pred": [
+      "cars [genre]"
+     ],
+     "false_positives": [
+      "cars [genre]"
+     ],
+     "false_negatives": [
+      "cars that talk [plot]"
+     ]
+    },
+    {
+     "index": 3,
+     "text": "what science fiction films have come out recently",
+     "gold": [
+      "science fiction [genre]",
+      "recently [year]"
+     ],
+     "pred": [
+      "science fiction [genre]"
+     ],
+     "false_positives": [],
+     "false_negatives": [
+      "recently [year]"
+     ]
+    },
+    {
+     "index": 4,
+     "text": "did the same director make all of the harry potter movies",
+     "gold": [
+      "harry potter [title]"
+     ],
+     "pred": [
+      "director [director]",
+      "harry potter [title]"
+     ],
+     "false_positives": [
+      "director [director]"
+     ],
+     "false_negatives": []
+    },
+    {
+     "index": 5,
+     "text": "show me 1980s action movies",
+     "gold": [
+      "1980s [year]",
+      "action [genre]"
+     ],
+     "pred": [
+      "1980s [year]",
+      "action movies [genre]"
+     ],
+     "false_positives": [
+      "action movies [genre]"
+     ],
+     "false_negatives": [
+      "action [genre]"
+     ]
+    }
+   ]
+  }
+ },
+ "env": {
+  "date_utc": "2026-10-14T10:33:18+00:00",
+  "git_sha": "2757ad4a2c4a6cae2fe569d0ab3608af078ad479",
+  "git_dirty": false,
+  "python": "3.11.15",
+  "platform": "macOS-15.6.1-arm64-arm-64bit",
+  "cpu": "Apple M4",
+  "cpu_count": 10,
+  "ram_gb": 16.0,
+  "gpu": "Apple MPS",
+  "packages": {
+   "torch": "2.11.0",
+   "transformers": "5.1.0",
+   "gliner": "0.2.27",
+   "onnx": "1.22.0",
+   "onnxruntime": "1.24.4",
+   "openvino": "2026.2.1",
+   "nncf": "3.2.0",
+   "numpy": "2.4.4",
+   "accelerate": "1.14.0"
+  }
+ }
+}

@@ -1,0 +1,137 @@
+{
+ "max_width": 12,
+ "rows": [
+  {
+   "dataset": "conll2003",
+   "split": "train",
+   "n_sentences": 14041,
+   "n_types": 4,
+   "n_entities": 23429,
+   "n_entities_wider_than_max_width": 0,
+   "n_candidate_pairs": 6655148,
+   "n_positive_pairs": 23429,
+   "negatives_per_positive": 283.0559989756285
+  },
+  {
+   "dataset": "conll2003",
+   "split": "test",
+   "n_sentences": 3453,
+   "n_types": 4,
+   "n_entities": 5628,
+   "n_entities_wider_than_max_width": 0,
+   "n_candidate_pairs": 1472652,
+   "n_positive_pairs": 5628,
+   "negatives_per_positive": 260.66524520255865
+  },
+  {
+   "dataset": "wnut17",
+   "split": "test",
+   "n_sentences": 1287,
+   "n_types": 6,
+   "n_entities": 1079,
+   "n_entities_wider_than_max_width": 2,
+   "n_candidate_pairs": 1211826,
+   "n_positive_pairs": 1077,
+   "negatives_per_positive": 1124.1866295264624
+  },
+  {
+   "dataset": "crossner_ai",
+   "split": "test",
+   "n_sentences": 431,
+   "n_types": 14,
+   "n_entities": 1809,
+   "n_entities_wider_than_max_width": 0,
+   "n_candidate_pairs": 1785868,
+   "n_positive_pairs": 1809,
+   "negatives_per_positive": 986.2128247650636
+  },
+  {
+   "dataset": "crossner_literature",
+   "split": "test",
+   "n_sentences": 416,
+   "n_types": 12,
+   "n_entities": 2266,
+   "n_entities_wider_than_max_width": 0,
+   "n_candidate_pairs": 1997304,
+   "n_positive_pairs": 2266,
+   "negatives_per_positive": 880.422771403354
+  },
+  {
+   "dataset": "crossner_music",
+   "split": "test",
+   "n_sentences": 465,
+   "n_types": 13,
+   "n_entities": 3336,
+   "n_entities_wider_than_max_width": 2,
+   "n_candidate_pairs": 2659410,
+   "n_positive_pairs": 3334,
+   "negatives_per_positive": 796.6634673065387
+  },
+  {
+   "dataset": "crossner_politics",
+   "split": "test",
+   "n_sentences": 651,
+   "n_types": 9,
+   "n_entities": 4209,
+   "n_entities_wider_than_max_width": 1,
+   "n_candidate_pairs": 2592486,
+   "n_positive_pairs": 4208,
+   "negatives_per_positive": 615.0850760456274
+  },
+  {
+   "dataset": "crossner_science",
+   "split": "test",
+   "n_sentences": 543,
+   "n_types": 17,
+   "n_entities": 3089,
+   "n_entities_wider_than_max_width": 1,
+   "n_candidate_pairs": 3366340,
+   "n_positive_pairs": 3088,
+   "negatives_per_positive": 1089.1360103626944
+  },
+  {
+   "dataset": "mit_movie",
+   "split": "test",
+   "n_sentences": 2443,
+   "n_types": 12,
+   "n_entities": 5339,
+   "n_entities_wider_than_max_width": 0,
+   "n_candidate_pairs": 1790976,
+   "n_positive_pairs": 5339,
+   "negatives_per_positive": 334.4515826933883
+  },
+  {
+   "dataset": "mit_restaurant",
+   "split": "test",
+   "n_sentences": 1521,
+   "n_types": 8,
+   "n_entities": 3151,
+   "n_entities_wider_than_max_width": 0,
+   "n_candidate_pairs": 647544,
+   "n_positive_pairs": 3151,
+   "negatives_per_positive": 204.50428435417328
+  }
+ ],
+ "env": {
+  "date_utc": "2026-10-14T10:27:42+00:00",
+  "git_sha": "2757ad4a2c4a6cae2fe569d0ab3608af078ad479",
+  "git_dirty": false,
+  "python": "3.11.15",
+  "platform": "macOS-15.6.1-arm64-arm-64bit",
+  "cpu": "Apple M4",
+  "cpu_count": 10,
+  "ram_gb": 16.0,
+  "gpu": "Apple MPS",
+  "packages": {
+   "torch": "2.11.0",
+   "transformers": "5.1.0",
+   "gliner": "0.2.27",
+   "onnx": "1.22.0",
+   "onnxruntime": "1.24.4",
+   "openvino": "2026.2.1",
+   "nncf": "3.2.0",
+   "numpy": "2.4.4",
+   "accelerate": "1.14.0"
+  }
+ }
+}
