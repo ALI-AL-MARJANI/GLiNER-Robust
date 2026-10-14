@@ -84,26 +84,33 @@ def deploy_figures(path: Path) -> None:
     fig, ax = plt.subplots(figsize=(6.4, 4.2))
     _style(ax)
     ax.grid(axis="y", color=GRID, linewidth=0.8)
-    points = sorted(
-        (
-            (rec["latency"][key]["p50_ms"], 100 * rec["accuracy_avg_f1"], name, rec["size_mb"])
-            for name, rec in ok.items()
-        )
-    )
-    for i, (x, y, name, size) in enumerate(points):
+    points = [
+        (rec["latency"][key]["p50_ms"], 100 * rec["accuracy_avg_f1"], name, rec["size_mb"]) for name, rec in ok.items()
+    ]
+    xs, ys = [pt[0] for pt in points], [pt[1] for pt in points]
+    ax.set_ylim(min(ys) - 6, max(ys) + 8)
+    ax.set_xlim(0, max(xs) * 1.6)
+    # Labels: labels whose text would overlap horizontally (points closer than `near` on x) are stacked
+    # at least `gap` apart and joined to their point by a thin leader line.
+    near, gap = 0.45 * max(xs), 0.075 * (max(ys) - min(ys) + 14)  # label text is ~0.4 * max(xs) wide
+    placed: list = []
+    for x, y, name, size in sorted(points, key=lambda pt: -pt[1]):
+        ly = y
+        for px, py in placed:
+            if abs(px - x) < near and abs(py - ly) < gap:
+                ly = py - gap
+        placed.append((x, ly))
         ax.scatter(x, y, s=60, color=BLUE, edgecolor=SURFACE, linewidth=2, zorder=3)
-        # alternate labels above / below so neighbouring points do not collide
         ax.annotate(
             f"{name} ({size:.0f} MB)",
             (x, y),
-            textcoords="offset points",
-            xytext=(6, 8 if i % 2 == 0 else -14),
+            xytext=(x + 0.04 * max(xs), ly),
+            textcoords="data",
+            va="center",
             fontsize=8,
             color=INK_2,
+            arrowprops={"arrowstyle": "-", "color": GRID, "linewidth": 0.8},
         )
-    ys = [pt[1] for pt in points]
-    ax.set_ylim(min(ys) - 5, max(ys) + 6)
-    ax.set_xlim(0, max(pt[0] for pt in points) * 1.45)
     ax.set_xlabel("p50 latency, 64 words, batch 1 (ms)", color=INK_2)
     ax.set_ylabel("Average micro-F1 (%)", color=INK_2)
     ax.set_title(

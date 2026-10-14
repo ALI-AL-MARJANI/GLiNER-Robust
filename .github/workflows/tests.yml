@@ -66,6 +66,6 @@ jobs:
       - name: ruff check
         run: >-
           ruff check gliner experiments
-          scripts/train_ablation.py scripts/analyze_ablation.py scripts/bench_deploy.py
-          scripts/eval_zero_shot.py scripts/span_imbalance.py scripts/make_figures.py
+          scripts/train_ablation.py scripts/analyze_ablation.py scripts/bench_deploy.py scripts/analyze_deploy.py
+          scripts/eval_zero_shot.py scripts/span_imbalance.py scripts/make_figures.py scripts/error_examples.py
           tests/test_span_losses.py tests/test_experiments.py tests/test_deploy.py
