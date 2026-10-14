@@ -1,251 +1,214 @@
-"""Step 2 — Loss function ablation training script.
+"""Loss ablation: fine-tune on CoNLL-2003, select on CoNLL-2003 dev, evaluate zero-shot.
 
-Runs five compact fine-tuning experiments comparing loss configurations
-on CoNLL-2003 training data, evaluating each checkpoint on WNUT-17.
-
-Configs (in order):
-    bce          — alpha=-1, gamma=0  (plain BCE, baseline)
-    focal_025    — alpha=0.25, gamma=2
-    focal_070    — alpha=0.70, gamma=2  (bi-encoder paper defaults)
-    dice         — SpanDiceLoss, gamma=1.0
-    dice_width   — SpanDiceLoss + span-width weighting
+One JSON per (variant, seed) is written to ``<output_dir>/runs/``. Existing
+run files are skipped, so an interrupted grid can be resumed by re-running the
+same command. ``scripts/analyze_ablation.py`` aggregates the runs.
 
 Usage:
-    python scripts/train_ablation.py \
-        --base_model urchade/gliner-multitask-large-v0.5 \
-        --max_steps 200 \
-        --output_dir results/ablation
+    python -m scripts.train_ablation --config configs/experiments/ablation.yaml
+    python -m scripts.train_ablation --variants bce dice --seeds 0 1 2
+    python -m scripts.train_ablation --smoke   # 20 steps, tiny eval, writes to /tmp
 """
 
 from __future__ import annotations
 
-import argparse
-import csv
-import sys
+import copy
+import json
 import time
-from dataclasses import dataclass
+import argparse
+import tempfile
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
+import yaml
 import torch
+from transformers import TrainerCallback
+from transformers.trainer_utils import set_seed
 
-try:
-    from datasets import load_dataset
-except ImportError:
-    sys.exit("pip install datasets")
-
-try:
-    from gliner import GLiNER
-    from gliner.training import TrainingArguments
-except ImportError:
-    sys.exit("pip install -e '.[training]' from repo root")
+from gliner import GLiNER
+from experiments.env import collect_env
+from gliner.training import Trainer, TrainingArguments
+from experiments.data import load
+from experiments.metrics import f1_from_counts
+from experiments.evaluate import predict, evaluate_dataset
 
 
-# ---------------------------------------------------------------------------
-# BIO → GLiNER format
-# ---------------------------------------------------------------------------
+class SelectOnDev(TrainerCallback):
+    """Every ``eval_every`` steps, score the model on a dev set and keep the best weights in memory."""
 
-WNUT17_TAG_TO_LABEL = {
-    1: "corporation",  2: "corporation",
-    3: "creative-work", 4: "creative-work",
-    5: "group",        6: "group",
-    7: "location",     8: "location",
-    9: "person",      10: "person",
-    11: "product",    12: "product",
-}
-WNUT17_LABELS = ["person", "location", "corporation", "creative-work", "group", "product"]
+    def __init__(self, gliner_model: GLiNER, dev: List[Dict], labels: List[str], eval_every: int, eval_cfg: Dict):
+        self.gliner_model = gliner_model
+        self.dev = dev
+        self.labels = labels
+        self.eval_every = eval_every
+        self.eval_cfg = eval_cfg
+        self.history: List[Dict[str, float]] = []
+        self.best_f1 = -1.0
+        self.best_step: Optional[int] = None
+        self.best_state: Optional[Dict[str, torch.Tensor]] = None
 
-CONLL_TAG_TO_LABEL = {
-    1: "person",        2: "person",
-    3: "organization",  4: "organization",
-    5: "location",      6: "location",
-    7: "miscellaneous", 8: "miscellaneous",
-}
+    def _score(self, step: int) -> None:
+        was_training = self.gliner_model.training
+        out = predict(
+            self.gliner_model,
+            self.dev,
+            self.labels,
+            threshold=self.eval_cfg["threshold"],
+            batch_size=self.eval_cfg["batch_size"],
+        )
+        f1 = f1_from_counts(out["counts"])
+        self.history.append({"step": step, "dev_f1": f1})
+        if f1 > self.best_f1:
+            self.best_f1, self.best_step = f1, step
+            self.best_state = {k: v.detach().to("cpu", copy=True) for k, v in self.gliner_model.state_dict().items()}
+        if was_training:
+            self.gliner_model.train()
 
-
-def bio_to_spans(tokens: list, tags: list, tag_to_label: dict) -> list:
-    spans, start, label = [], None, None
-    for i, tag in enumerate(tags):
-        lbl = tag_to_label.get(tag)
-        if lbl is None:
-            if start is not None:
-                spans.append([start, i - 1, label])
-                start, label = None, None
-            continue
-        if tag % 2 == 1 or label != lbl:
-            if start is not None:
-                spans.append([start, i - 1, label])
-            start, label = i, lbl
-    if start is not None:
-        spans.append([start, len(tags) - 1, label])
-    return spans
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.eval_every == 0 or state.global_step == state.max_steps:
+            self._score(state.global_step)
+        return control
 
 
-def hf_to_gliner(examples: list, tag_to_label: dict) -> list:
-    return [
-        {"tokenized_text": ex["tokens"],
-         "ner": bio_to_spans(ex["tokens"], ex["ner_tags"], tag_to_label)}
-        for ex in examples
-    ]
+def _as_gliner(examples: List[Dict]) -> List[Dict]:
+    return [{"tokenized_text": ex["tokenized_text"], "ner": [list(s) for s in ex["ner"]]} for ex in examples]
 
 
-# ---------------------------------------------------------------------------
-# Ablation configurations
-# ---------------------------------------------------------------------------
+def run_one(cfg: Dict[str, Any], variant: str, seed: int, out_path: Path, smoke: bool) -> Dict[str, Any]:
+    tcfg = dict(cfg["training"])
+    ecfg = cfg["evaluation"]
+    vcfg = cfg["variants"][variant]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-@dataclass
-class AblationCfg:
-    name: str
-    description: str
-    loss_type: str
-    focal_alpha: float
-    focal_gamma: float
-    dice_gamma: float
-    use_span_width_weight: bool
+    set_seed(seed)
+    model = GLiNER.from_pretrained(cfg["base_model"], revision=cfg.get("base_revision")).to(device)
 
+    train, _ = load(cfg["data"]["train"]["dataset"], cfg["data"]["train"]["split"])
+    sel = cfg["data"]["select"]
+    dev, dev_labels = load(sel["dataset"], sel["split"])
+    dev = dev[: sel.get("max_examples") or None]
 
-ABLATION_CONFIGS = [
-    AblationCfg("bce",        "Plain BCE (alpha=-1, gamma=0)",                  "focal", -1.0, 0.0, 1.0, False),
-    AblationCfg("focal_025",  "Focal (alpha=0.25, gamma=2)",                    "focal",  0.25, 2.0, 1.0, False),
-    AblationCfg("focal_070",  "Focal (alpha=0.70, gamma=2) — bi-encoder paper", "focal",  0.70, 2.0, 1.0, False),
-    AblationCfg("dice",       "Span Dice Loss (gamma=1.0)",                     "dice",  -1.0, 0.0, 1.0, False),
-    AblationCfg("dice_width", "Dice + span-width weighting",                    "dice",  -1.0, 0.0, 1.0, True),
-]
+    max_steps, eval_every = tcfg.pop("max_steps"), tcfg.pop("eval_every")
+    if smoke:
+        max_steps, eval_every, dev = 20, 10, dev[:32]
+    fp16 = tcfg.pop("fp16")
+    fp16 = torch.cuda.is_available() if fp16 == "auto" else bool(fp16)
 
+    callback = SelectOnDev(model, dev, dev_labels, eval_every, ecfg)
+    with tempfile.TemporaryDirectory() as tmp:
+        args = TrainingArguments(
+            output_dir=tmp,
+            max_steps=max_steps,
+            seed=seed,
+            data_seed=seed,
+            save_strategy="no",
+            eval_strategy="no",
+            logging_steps=50,
+            report_to="none",
+            dataloader_num_workers=0,
+            fp16=fp16,
+            use_cpu=device == "cpu",
+            **tcfg,
+            **vcfg,
+        )
+        # Same construction as GLiNER.train_model, plus the selection callback.
+        trainer = Trainer(
+            model=model,
+            args=args,
+            train_dataset=_as_gliner(train),
+            data_collator=model._create_data_collator(),
+            processing_class=model.data_processor.transformer_tokenizer,
+            callbacks=[callback],
+        )
+        t0 = time.perf_counter()
+        trainer.train()
+        train_seconds = time.perf_counter() - t0
+        loss_log = [
+            {"step": e["step"], "loss": e["loss"]} for e in trainer.state.log_history if "loss" in e and "step" in e
+        ]
+        trainer.callback_handler.callbacks.clear()
+    del trainer
 
-# ---------------------------------------------------------------------------
-# Single config run
-# ---------------------------------------------------------------------------
+    if callback.best_state is None:
+        callback._score(max_steps)
+    model.load_state_dict(callback.best_state)
+    model.eval()
 
-def run_one(cfg: AblationCfg, base_model: str, train_data: list, eval_data: list,
-            output_dir: Path, max_steps: int, batch_size: int, threshold: float) -> dict:
-    print(f"\n{'─'*60}")
-    print(f"  Config: {cfg.name}  —  {cfg.description}")
-    print(f"{'─'*60}")
+    threshold_sweep = {}
+    for t in ecfg["threshold_grid"]:
+        out = predict(model, dev, dev_labels, threshold=t, batch_size=ecfg["batch_size"])
+        threshold_sweep[str(t)] = f1_from_counts(out["counts"])
+    tuned = float(max(threshold_sweep, key=lambda k: (threshold_sweep[k], -abs(float(k) - 0.5))))
 
-    run_dir = output_dir / cfg.name
-    run_dir.mkdir(parents=True, exist_ok=True)
+    datasets = cfg["data"]["eval_in_domain"] + cfg["data"]["eval_zero_shot"]
+    results: Dict[str, Dict[str, Any]] = {"fixed": {}, "tuned": {}}
+    thresholds = {"fixed": ecfg["threshold"], "tuned": tuned}
+    for mode, threshold in thresholds.items():
+        for name in datasets:
+            r = evaluate_dataset(
+                model,
+                name,
+                threshold=threshold,
+                batch_size=ecfg["batch_size"],
+                max_examples=32 if smoke else None,
+            )
+            results[mode][name] = r
+            print(f"  [{variant} seed={seed} {mode} t={threshold}] {name:22s} F1={r['f1'] * 100:6.2f}")
 
-    model = GLiNER.from_pretrained(base_model)
-
-    training_args = TrainingArguments(
-        output_dir=str(run_dir),
-        max_steps=max_steps,
-        per_device_train_batch_size=batch_size,
-        learning_rate=5e-5,
-        weight_decay=0.01,
-        others_lr=1e-4,
-        others_weight_decay=0.0,
-        # ── Loss function config ──────────────────────────────────────────
-        loss_type=cfg.loss_type,
-        focal_loss_alpha=cfg.focal_alpha,
-        focal_loss_gamma=cfg.focal_gamma,
-        dice_gamma=cfg.dice_gamma,
-        use_span_width_weight=cfg.use_span_width_weight,
-        # ──────────────────────────────────────────────────────────────────
-        negatives=1.0,
-        masking="global",
-        loss_reduction="sum",
-        logging_steps=50,
-        save_steps=max_steps,
-        save_total_limit=1,
-        report_to="none",
-        dataloader_num_workers=0,
-    )
-
-    t0 = time.perf_counter()
-    model.train_model(
-        train_dataset=train_data,
-        eval_dataset=None,
-        training_args=training_args,
-    )
-    train_time = time.perf_counter() - t0
-    print(f"  Trained in {train_time:.0f}s")
-
-    print("  Evaluating on WNUT-17...")
-    wnut_data = hf_to_gliner(eval_data, WNUT17_TAG_TO_LABEL)
-    _, f1 = model.evaluate(
-        wnut_data,
-        flat_ner=True,
-        threshold=threshold,
-        batch_size=8,
-        entity_types=WNUT17_LABELS,
-    )
-    f1 = float(f1)
-    print(f"  WNUT-17 F1: {f1*100:.2f}%")
-
-    return {
-        "config":              cfg.name,
-        "description":         cfg.description,
-        "loss_type":           cfg.loss_type,
-        "focal_alpha":         cfg.focal_alpha,
-        "focal_gamma":         cfg.focal_gamma,
-        "dice_gamma":          cfg.dice_gamma,
-        "use_span_width_weight": cfg.use_span_width_weight,
-        "wnut17_f1":           round(f1, 4),
-        "wnut17_f1_pct":       round(f1 * 100, 2),
-        "max_steps":           max_steps,
-        "train_time_s":        round(train_time, 1),
+    record = {
+        "variant": variant,
+        "seed": seed,
+        "smoke": smoke,
+        "config": {"base_model": cfg["base_model"], "base_revision": cfg.get("base_revision"), **cfg},
+        "variant_config": vcfg,
+        "max_steps": max_steps,
+        "selection": {
+            "dataset": sel["dataset"],
+            "split": sel["split"],
+            "n": len(dev),
+            "history": callback.history,
+            "best_step": callback.best_step,
+            "best_dev_f1": callback.best_f1,
+            "threshold_sweep": threshold_sweep,
+            "tuned_threshold": tuned,
+        },
+        "thresholds": thresholds,
+        "train_loss": loss_log,
+        "train_seconds": train_seconds,
+        "results": results,
+        "env": collect_env(),
     }
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--base_model", default="urchade/gliner-multitask-large-v0.5")
-    p.add_argument("--output_dir", default="results/ablation")
-    p.add_argument("--max_steps",  type=int, default=200,
-                   help="Steps per config. 200 is enough to see loss function differences.")
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--train_max",  type=int, default=1500,
-                   help="Cap training examples for speed")
-    p.add_argument("--threshold",  type=float, default=0.5)
-    p.add_argument("--configs",    nargs="+", default=None,
-                   help="Subset of config names. Omit to run all 5.")
-    return p.parse_args()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(record))
+    return record
 
 
 def main() -> None:
-    args = parse_args()
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--config", default="configs/experiments/ablation.yaml")
+    p.add_argument("--output_dir", default="results/ablation")
+    p.add_argument("--variants", nargs="+", default=None, help="Subset of variants (default: all in config).")
+    p.add_argument("--seeds", nargs="+", type=int, default=None, help="Subset of seeds (default: config).")
+    p.add_argument("--smoke", action="store_true", help="20 steps + 32-sentence evals, written to a temp dir.")
+    a = p.parse_args()
 
-    print(f"\n{'='*60}")
-    print("  GLiNER-Robust — Step 2: Loss Function Ablation")
-    print(f"{'='*60}\n")
+    cfg = yaml.safe_load(Path(a.config).read_text())
+    variants = a.variants or list(cfg["variants"])
+    seeds = a.seeds if a.seeds is not None else cfg["seeds"]
+    out_dir = Path(tempfile.mkdtemp(prefix="ablation_smoke_")) if a.smoke else Path(a.output_dir)
+    unknown = set(variants) - set(cfg["variants"])
+    if unknown:
+        raise SystemExit(f"Unknown variants: {sorted(unknown)}")
 
-    print("Loading datasets...")
-    raw_train = list(load_dataset("conll2003", split="train", trust_remote_code=True))[:args.train_max]
-    raw_eval  = list(load_dataset("wnut_17",   split="test",  trust_remote_code=True))
-    train_data = hf_to_gliner(raw_train, CONLL_TAG_TO_LABEL)
-    print(f"  Train: {len(train_data)} examples (CoNLL-2003)")
-    print(f"  Eval:  {len(raw_eval)} examples (WNUT-17)\n")
-
-    configs = ABLATION_CONFIGS
-    if args.configs:
-        configs = [c for c in ABLATION_CONFIGS if c.name in args.configs]
-
-    results = []
-    for cfg in configs:
-        row = run_one(cfg, args.base_model, train_data, raw_eval,
-                      output_dir, args.max_steps, args.batch_size, args.threshold)
-        results.append(row)
-
-    csv_path = output_dir / "ablation_results.csv"
-    if results:
-        with csv_path.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(results[0].keys()))
-            writer.writeheader()
-            writer.writerows(results)
-
-    print(f"\n{'='*60}  ABLATION RESULTS — WNUT-17 F1")
-    print(f"  {'Config':<14} {'F1 (%)':>8}  Description")
-    print(f"  {'-'*14} {'-'*8}  {'-'*35}")
-    for r in results:
-        print(f"  {r['config']:<14} {r['wnut17_f1_pct']:>7.2f}%  {r['description']}")
-    print(f"\n  Saved → {csv_path}\n")
+    for variant in variants:
+        for seed in seeds:
+            path = out_dir / "runs" / f"{variant}__seed{seed}.json"
+            if path.exists():
+                print(f"skip {path} (exists)")
+                continue
+            print(f"\n=== {variant} seed={seed} -> {path}")
+            run_one(copy.deepcopy(cfg), variant, seed, path, a.smoke)
+    print(f"\nRun files in {out_dir / 'runs'}")
 
 
 if __name__ == "__main__":

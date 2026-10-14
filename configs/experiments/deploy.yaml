@@ -1,0 +1,32 @@
+# CPU deployment benchmark: same checkpoint, six inference backends.
+# Used by scripts/bench_deploy.py; every value the script uses is here.
+
+model: gliner-community/gliner_small-v2.5
+revision: f227d3cd637bd4e6757ae143935316d062393341
+
+backends: [pytorch_fp32, onnx_fp32, onnx_int8_dynamic, openvino_fp32, openvino_int8_weights, openvino_int8_static]
+
+threads: 4                 # torch.set_num_threads / ORT intra_op / OV INFERENCE_NUM_THREADS
+openvino_hint: LATENCY
+
+calibration:               # openvino_int8_static only
+  dataset: conll2003
+  split: dev
+  n_sentences: 300
+  seed: 0
+  ignored_patterns: []     # e.g. [".*span_rep_layer.*", ".*prompt_rep_layer.*"] keeps the heads in FP32
+  ignored_types: []        # e.g. [LSTMSequence, Einsum]
+
+accuracy:
+  threshold: 0.5
+  batch_size: 8
+  datasets: [wnut17, crossner_ai, crossner_literature, crossner_music,
+             crossner_politics, crossner_science, mit_movie, mit_restaurant]
+
+latency:
+  labels: [person, location, organization, product, creative work, group]  # WNUT-17 types
+  words: [16, 64, 256]     # inputs cut from CoNLL-2003 test text to exactly this many words
+  batch_sizes: [1, 8]
+  warmup: 10
+  repetitions: 50          # timed calls per (backend, words, batch)
+  source: {dataset: conll2003, split: test}

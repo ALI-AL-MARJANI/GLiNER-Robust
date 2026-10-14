@@ -1,0 +1,50 @@
+# Loss ablation: fine-tune one fixed GLiNER checkpoint on CoNLL-2003 with each
+# loss variant and several seeds, select the checkpoint on CoNLL-2003 dev,
+# then evaluate in-domain (CoNLL-2003 test) and zero-shot (8 benchmarks).
+# Every value used by scripts/train_ablation.py is in this file.
+
+base_model: gliner-community/gliner_small-v2.5
+base_revision: f227d3cd637bd4e6757ae143935316d062393341
+
+seeds: [0, 1, 2, 3, 4]
+
+data:
+  train: {dataset: conll2003, split: train}  # 14,041 sentences, full split
+  select: {dataset: conll2003, split: dev, max_examples: 1000}  # checkpoint selection only
+  eval_in_domain: [conll2003]
+  eval_zero_shot: [wnut17, crossner_ai, crossner_literature, crossner_music,
+                   crossner_politics, crossner_science, mit_movie, mit_restaurant]
+
+training:  # optimizer values follow upstream configs/config_span.yaml
+  max_steps: 2000           # ~1.1 epochs at batch 8
+  eval_every: 500           # CoNLL-2003 dev F1 at steps 500/1000/1500/2000, best kept
+  per_device_train_batch_size: 8
+  learning_rate: 1.0e-5     # encoder
+  others_lr: 3.0e-5         # span / prompt heads
+  weight_decay: 0.1
+  others_weight_decay: 0.01
+  lr_scheduler_type: cosine
+  warmup_steps: 100         # 5% of max_steps
+  max_grad_norm: 10.0
+  loss_reduction: sum
+  negatives: 1.0
+  masking: none
+  fp16: auto                # true on CUDA, false elsewhere
+
+evaluation:
+  threshold: 0.5            # used during checkpoint selection and for the fixed-threshold report
+  # Dice does not produce calibrated probabilities, so a fixed 0.5 threshold would
+  # penalize it for reasons unrelated to ranking quality. Each run also picks its
+  # threshold on the selection set (CoNLL-2003 dev) and reports both.
+  threshold_grid: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+  batch_size: 16
+
+# One row per component. "bce" is the baseline every other row is tested against.
+variants:
+  bce:          {loss_type: focal, focal_loss_alpha: -1.0, focal_loss_gamma: 0.0}
+  focal_a025:   {loss_type: focal, focal_loss_alpha: 0.25, focal_loss_gamma: 2.0}
+  focal_a050:   {loss_type: focal, focal_loss_alpha: 0.50, focal_loss_gamma: 2.0}
+  focal_a075:   {loss_type: focal, focal_loss_alpha: 0.75, focal_loss_gamma: 2.0}
+  bce_width:    {loss_type: focal, focal_loss_alpha: -1.0, focal_loss_gamma: 0.0, use_span_width_weight: true}
+  dice:         {loss_type: dice, dice_alpha: 1.0, dice_smooth: 1.0}
+  dice_width:   {loss_type: dice, dice_alpha: 1.0, dice_smooth: 1.0, use_span_width_weight: true}
