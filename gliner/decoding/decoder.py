@@ -25,6 +25,45 @@ def _threshold_compare_tensor(threshold, batch_size: int, device, dims: int):
     return threshold
 
 
+def _label_threshold_tensor(
+    threshold: Dict[str, float],
+    id_to_class_per_item: List[Dict[int, str]],
+    num_classes: int,
+    device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    Resolve a ``{label: threshold}`` mapping into a per-class threshold tensor.
+
+    Args:
+        threshold (Dict[str, float]): Threshold for each label. Labels that are not
+            requested in the batch are ignored.
+        id_to_class_per_item (List[Dict[int, str]]): Class ID to class name mapping
+            for each batch item.
+        num_classes (int): Size of the class dimension (C).
+        device: Device on which to create the tensor.
+        dtype (torch.dtype): Dtype of the returned tensor.
+
+    Returns:
+        torch.Tensor: Tensor of shape (B, C). Padded class slots get ``inf`` so they
+            never pass.
+
+    Raises:
+        ValueError: If a requested label has no threshold.
+    """
+    missing = sorted({label for mapping in id_to_class_per_item for label in mapping.values()} - threshold.keys())
+    if missing:
+        raise ValueError(f"threshold mapping has no value for labels {missing}")
+    rows = [
+        [
+            float(threshold[id_to_class[class_idx + 1]]) if class_idx + 1 in id_to_class else float("inf")
+            for class_idx in range(num_classes)
+        ]
+        for id_to_class in id_to_class_per_item
+    ]
+    return torch.tensor(rows, dtype=dtype, device=device)
+
+
 def _get_valid_classes_mask(num_classes, id_to_classes: Dict[int, str] | List[Dict[int, str]], device) -> torch.Tensor:
     """
     Create a boolean mask indicating valid classes for each batch item.
@@ -488,7 +527,19 @@ class BaseSpanDecoder(BaseDecoder):
         device = probs.device
 
         B, L, K_dim, C = probs.shape
-        thresholds = _expand_batch_param(threshold, B, "threshold")
+        if isinstance(threshold, dict):
+            per_label = _label_threshold_tensor(
+                threshold,
+                [self._get_id_to_class_for_sample(id_to_classes, i) for i in range(B)],
+                C,
+                device,
+                probs.dtype,
+            )
+            # (C,) per item for the single-item path, (B, 1, 1, C) for the batched comparison.
+            thresholds = list(per_label)
+            threshold = per_label.view(B, 1, 1, C)
+        else:
+            thresholds = _expand_batch_param(threshold, B, "threshold")
         flat_ner_values = _expand_batch_param(flat_ner, B, "flat_ner")
         multi_label_values = _expand_batch_param(multi_label, B, "multi_label")
 
@@ -612,7 +663,7 @@ class BaseSpanDecoder(BaseDecoder):
         id_to_classes: Dict[int, str] | List[Dict[int, str]],
         model_output: torch.Tensor,
         flat_ner: bool = False,
-        threshold: float = 0.5,
+        threshold: float | List[float] | Dict[str, float] = 0.5,
         multi_label: bool = False,
         return_class_probs: bool = False,
         input_spans: List[List[Tuple[int, int]]] | None = None,
@@ -629,7 +680,8 @@ class BaseSpanDecoder(BaseDecoder):
                 where B is batch size, L is sequence length, K is max span width,
                 C is number of classes.
             flat_ner (bool): Whether to enforce non-overlapping spans.
-            threshold (float): Confidence threshold for span predictions.
+            threshold (float | List[float] | Dict[str, float]): Confidence threshold for
+                span predictions: one value, one value per batch item, or one value per label.
             multi_label (bool): Whether to allow multiple labels per span.
             return_class_probs (bool): Whether to include class probabilities in output.
             input_spans (Optional[List[List[Tuple[int, int]]]]): If provided, only these
@@ -724,7 +776,6 @@ class SpanDecoder(BaseSpanDecoder):
         span_mask = span_mask.view(span_mask.size(0), -1).bool()
 
         batch_size, _, num_classes = probabilities.shape
-        thresholds = _expand_batch_param(threshold, batch_size, "threshold")
         flat_values = _expand_batch_param(flat_ner, batch_size, "flat_ner")
         multi_values = _expand_batch_param(multi_label, batch_size, "multi_label")
 
@@ -752,11 +803,20 @@ class SpanDecoder(BaseSpanDecoder):
             device=probabilities.device,
         )
 
-        threshold_tensor = torch.as_tensor(
-            thresholds,
-            dtype=probabilities.dtype,
-            device=probabilities.device,
-        ).view(batch_size, 1, 1)
+        if isinstance(threshold, dict):
+            threshold_tensor = _label_threshold_tensor(
+                threshold,
+                id_to_class_per_item,
+                num_classes,
+                probabilities.device,
+                probabilities.dtype,
+            ).unsqueeze(1)
+        else:
+            threshold_tensor = torch.as_tensor(
+                _expand_batch_param(threshold, batch_size, "threshold"),
+                dtype=probabilities.dtype,
+                device=probabilities.device,
+            ).view(batch_size, 1, 1)
         candidate_mask = valid_spans.unsqueeze(-1) & valid_classes.unsqueeze(1) & (probabilities > threshold_tensor)
         batch_indices, span_positions, class_indices = torch.where(candidate_mask)
         if batch_indices.numel() == 0:

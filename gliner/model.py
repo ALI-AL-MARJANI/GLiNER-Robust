@@ -2872,7 +2872,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
     def run_batch(
         self,
         batch: Dict[str, Any],
-        threshold: float = 0.5,
+        threshold: float | Dict[str, float] = 0.5,
         packing_config: InferencePackingConfig | None = None,
         move_to_device: bool = True,
         return_vectors: bool = False,
@@ -2882,7 +2882,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
 
         Args:
             batch: Collated batch from collate_batch.
-            threshold: Confidence threshold for predictions.
+            threshold: Confidence threshold, or a mapping from label to threshold.
             packing_config: Optional inference packing configuration.
             move_to_device: Whether to move tensors to model device.
             return_vectors: Whether to retain span representations for decoding.
@@ -2914,6 +2914,9 @@ class BaseEncoderGLiNER(BaseGLiNER):
 
         if return_vectors:
             model_inputs = {**model_inputs, "return_embeddings": True}
+        if isinstance(threshold, dict):
+            # Per-label thresholds are applied when decoding; the forward pass only gets a lower bound.
+            threshold = min(threshold.values(), default=0.5)
         model_output = self.model(**model_inputs, threshold=threshold)
         return model_output
 
@@ -2921,7 +2924,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
         self,
         model_output: Any,
         batch: Dict[str, Any],
-        threshold: float | List[float] = 0.5,
+        threshold: float | List[float] | Dict[str, float] = 0.5,
         flat_ner: bool | List[bool] = True,
         multi_label: bool | List[bool] = False,
         return_class_probs: bool = False,
@@ -2934,7 +2937,8 @@ class BaseEncoderGLiNER(BaseGLiNER):
         Args:
             model_output: Output from run_batch.
             batch: The collated batch (needs 'tokens' and 'id_to_classes').
-            threshold: Confidence threshold for predictions.
+            threshold: Confidence threshold, one per text, or a mapping from label to threshold
+                (span models only).
             flat_ner: Whether to use flat NER (no overlapping entities).
             multi_label: Whether to allow multiple labels per span.
             return_class_probs: Whether to include class probabilities.
@@ -2945,6 +2949,11 @@ class BaseEncoderGLiNER(BaseGLiNER):
         Returns:
             List of entity lists (one per text in batch).
         """
+        if isinstance(threshold, dict) and not isinstance(self.decoder, SpanDecoder):
+            raise NotImplementedError(
+                f"Per-label thresholds are only supported by span models, not {type(self.decoder).__name__}."
+            )
+
         model_logits = model_output[0]
         if not isinstance(model_logits, torch.Tensor):
             model_logits = torch.from_numpy(model_logits)
@@ -3025,7 +3034,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
         texts: str | List[str],
         labels: EntityLabels,
         flat_ner: bool = True,
-        threshold: float = 0.5,
+        threshold: float | Dict[str, float] = 0.5,
         multi_label: bool = False,
         batch_size: int = 8,
         packing_config: InferencePackingConfig | None = None,
@@ -3042,7 +3051,8 @@ class BaseEncoderGLiNER(BaseGLiNER):
             texts: A list of input texts to predict entities for or a single text string.
             labels: Shared or per-text entity labels, optionally mapped to descriptions.
             flat_ner: Whether to use flat NER. Defaults to True.
-            threshold: Confidence threshold for predictions. Defaults to 0.5.
+            threshold: Confidence threshold for predictions, or a mapping from label to
+                threshold (span models only; every requested label needs a value). Defaults to 0.5.
             multi_label: Whether to allow multiple labels per token. Defaults to False.
             batch_size: Batch size for processing. Defaults to 8.
             packing_config: Configuration describing how to pack encoder inputs. When None
@@ -3141,7 +3151,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
         text: str,
         labels: EntityLabels,
         flat_ner: bool = True,
-        threshold: float = 0.5,
+        threshold: float | Dict[str, float] = 0.5,
         multi_label: bool = False,
         return_class_probs: bool = False,
         *,
@@ -3155,7 +3165,8 @@ class BaseEncoderGLiNER(BaseGLiNER):
             text: The input text to predict entities for.
             labels: The labels to predict.
             flat_ner: Whether to use flat NER. Defaults to True.
-            threshold: Confidence threshold for predictions. Defaults to 0.5.
+            threshold: Confidence threshold for predictions, or a mapping from label to
+                threshold (span models only; every requested label needs a value). Defaults to 0.5.
             multi_label: Whether to allow multiple labels per entity. Defaults to False.
             return_class_probs: Whether to include class probabilities in output. Defaults to False.
             return_vectors: Whether to include a contextual vector for each returned entity.
@@ -3182,7 +3193,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
         texts: List[str],
         labels: EntityLabels,
         flat_ner: bool = True,
-        threshold: float = 0.5,
+        threshold: float | Dict[str, float] = 0.5,
         multi_label: bool = False,
         *,
         return_vectors: bool = False,
@@ -3200,7 +3211,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
             texts: Input texts.
             labels: Labels to predict.
             flat_ner: Use flat NER. Defaults to True.
-            threshold: Confidence threshold. Defaults to 0.5.
+            threshold: Confidence threshold, or a mapping from label to threshold. Defaults to 0.5.
             multi_label: Allow multiple labels per token/entity. Defaults to False.
             return_vectors: Whether to include a contextual vector for each returned entity.
             return_label_vectors: Whether to include the matched label vector for each entity.
@@ -3231,7 +3242,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
         calib_data: List[Dict[str, Any]],
         alpha: float,
         mode: str = "risk_control",
-        labels: Optional[List[str]] = None,
+        labels: List[str] | None = None,
     ) -> "BaseEncoderGLiNER":
         """Calibrate this model with a conformal coverage/risk guarantee.
 
@@ -3267,7 +3278,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
         return self
 
     @property
-    def conformal(self) -> Optional[Any]:
+    def conformal(self) -> Any | None:
         """The `ConformalGLiNER` wrapper built by `calibrate()`, or `None` if not yet calibrated."""
         return getattr(self, "_conformal_model", None)
 

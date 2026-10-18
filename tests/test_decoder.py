@@ -420,6 +420,69 @@ class TestSpanDecoder:
                 threshold=[0.5],
             )
 
+    @pytest.mark.parametrize("batch_size", [1, 2])
+    def test_per_label_thresholds(self, basic_config, batch_size):
+        """A label mapping should apply a different threshold to each class (batched and single-item paths)."""
+        decoder = SpanDecoder(basic_config)
+        logits = torch.full((batch_size, 2, 1, 2), -5.0)
+        logits[:, 0, 0, 0] = 1.0  # p ~ 0.73 for PERSON
+        logits[:, 1, 0, 1] = 1.0  # p ~ 0.73 for ORG
+
+        result = decoder.decode(
+            tokens=[["A", "B"]] * batch_size,
+            id_to_classes={1: "PERSON", 2: "ORG"},
+            model_output=logits,
+            threshold={"PERSON": 0.5, "ORG": 0.9},
+        )
+
+        for spans in result:
+            assert [(s.start, s.entity_type) for s in spans] == [(0, "PERSON")]
+
+    def test_per_label_thresholds_per_sample_id_to_classes(self, basic_config):
+        """Class slots should be resolved through each row's own label mapping."""
+        decoder = SpanDecoder(basic_config)
+        logits = torch.full((2, 1, 1, 2), -5.0)
+        logits[:, 0, 0, 0] = 1.0  # p ~ 0.73 in class slot 0 of both rows
+
+        result = decoder.decode(
+            tokens=[["A"], ["B"]],
+            id_to_classes=[{1: "PERSON", 2: "ORG"}, {1: "ORG"}],
+            model_output=logits,
+            threshold={"PERSON": 0.5, "ORG": 0.9},
+        )
+
+        assert [s.entity_type for s in result[0]] == ["PERSON"]
+        assert result[1] == []
+
+    def test_per_label_thresholds_explicit_spans(self, basic_config):
+        """Explicit-span decoding should honour per-label thresholds."""
+        decoder = SpanDecoder(basic_config)
+        logits = torch.tensor([[[1.0, 1.0]]])
+
+        result = decoder.decode(
+            tokens=[["Alice"]],
+            id_to_classes={1: "PERSON", 2: "ORG"},
+            model_output=logits,
+            span_idx=torch.tensor([[[0, 0]]]),
+            span_mask=torch.tensor([[True]]),
+            threshold={"PERSON": 0.9, "ORG": 0.5},
+        )
+
+        assert [s.entity_type for s in result[0]] == ["ORG"]
+
+    def test_per_label_thresholds_missing_label(self, basic_config):
+        """Every requested label needs a threshold; extra keys are ignored."""
+        decoder = SpanDecoder(basic_config)
+        logits = torch.ones(1, 1, 1, 2)
+
+        with pytest.raises(ValueError, match=r"no value for labels \['ORG'\]"):
+            decoder.decode(
+                tokens=[["A"]],
+                id_to_classes={1: "PERSON", 2: "ORG"},
+                model_output=logits,
+                threshold={"PERSON": 0.5, "LOCATION": 0.5},
+            )
+
 
 class TestSpanGenerativeDecoder:
     """Test suite for SpanGenerativeDecoder class."""
