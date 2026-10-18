@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import warnings
-from typing import Any, Dict, List, Union, Optional, Sequence
+from typing import Any, Dict, List, Sequence
 from collections import Counter, defaultdict
 from dataclasses import field, dataclass
 
@@ -33,11 +33,11 @@ class _CalibrationState:
     labels: List[str]
     calibrated_types: List[str]
     type_counts: Dict[str, int]
-    pooled_nc_threshold: Optional[float] = None
+    pooled_nc_threshold: float | None = None
     mondrian_thresholds: Dict[str, float] = field(default_factory=dict)
     mondrian_skipped: Dict[str, int] = field(default_factory=dict)
-    crc_lambda: Optional[float] = None
-    model_id: Optional[str] = None
+    crc_lambda: float | None = None
+    model_id: str | None = None
 
     def to_json_dict(self) -> Dict[str, Any]:
         return {
@@ -67,7 +67,7 @@ class ConformalGLiNER:
 
     def __init__(self, model: Any):
         self.model = model
-        self._state: Optional[_CalibrationState] = None
+        self._state: _CalibrationState | None = None
 
     @property
     def is_calibrated(self) -> bool:
@@ -95,13 +95,37 @@ class ConformalGLiNER:
         state = self._require_calibrated()
         return {etype: self._nc_threshold_for(state, etype) for etype in state.calibrated_types}
 
+    def probability_thresholds(self, labels: Sequence[str] | None = None) -> Dict[str, float]:
+        """Per-label probability thresholds for GLiNER's own ``threshold={label: value}`` API.
+
+        A calibrated label admits a span when ``1 - p <= tau``, so it maps to ``1 - tau``;
+        a label without a guarantee maps to GLiNER's default ``0.5``. This lets the
+        calibrated rule run through the standard inference path::
+
+            model.inference(texts, labels, threshold=cg.probability_thresholds(labels))
+
+        GLiNER keeps spans with ``p > threshold``, so the two rules differ only for a
+        score exactly equal to ``1 - tau``. Unlike :meth:`predict_entities`, the
+        result carries no ``"conformal"`` metadata and raises no warning for
+        uncalibrated labels.
+
+        Args:
+            labels: labels to return thresholds for. Defaults to the calibration label set.
+        """
+        state = self._require_calibrated()
+        labels = list(labels) if labels is not None else list(state.labels)
+        return {
+            label: 1.0 - self._nc_threshold_for(state, label) if label in state.calibrated_types else 0.5
+            for label in labels
+        }
+
     def _require_calibrated(self) -> _CalibrationState:
         if self._state is None:
             raise RuntimeError("ConformalGLiNER is not calibrated. Call calibrate() first.")
         return self._state
 
     @staticmethod
-    def _model_id(model: Any) -> Optional[str]:
+    def _model_id(model: Any) -> str | None:
         return getattr(getattr(model, "config", None), "_name_or_path", None)
 
     # ------------------------------------------------------------------ #
@@ -113,7 +137,7 @@ class ConformalGLiNER:
         calib_data: Sequence[Dict[str, Any]],
         alpha: float,
         mode: str = "risk_control",
-        labels: Optional[Sequence[str]] = None,
+        labels: Sequence[str] | None = None,
     ) -> ConformalGLiNER:
         """Calibrate the conformal threshold(s) on a held-out labeled set.
 
@@ -191,19 +215,19 @@ class ConformalGLiNER:
             # `calibrated_types` already met the same floor, so mondrian_calibrate below
             # should not skip any of them; the pooled value is kept regardless as the
             # documented, deterministic fallback path.
-            pooled_scores = [s for s, t in zip(scores, types) if t in calibrated_types]
+            pooled_scores = [s for s, t in zip(scores, types, strict=False) if t in calibrated_types]
             state.pooled_nc_threshold = split_conformal_quantile(pooled_scores, alpha)
 
         if mode == "mondrian":
             scores_by_type: Dict[str, List[float]] = defaultdict(list)
-            for s, t in zip(scores, types):
+            for s, t in zip(scores, types, strict=False):
                 if t in calibrated_types:
                     scores_by_type[t].append(s)
             state.mondrian_thresholds, state.mondrian_skipped = mondrian_calibrate(scores_by_type, alpha)
 
         if mode == "risk_control":
             gold_nc_scores: List[List[float]] = [[] for _ in calib_data]
-            for s, t, i in zip(scores, types, example_idx):
+            for s, t, i in zip(scores, types, example_idx, strict=False):
                 if t in calibrated_types:
                     gold_nc_scores[i].append(s)
             state.crc_lambda = crc_lambda_search(gold_nc_scores, alpha)
@@ -226,11 +250,11 @@ class ConformalGLiNER:
 
     def predict_entities(
         self,
-        text: Union[str, List[str]],
+        text: str | List[str],
         labels: Sequence[str],
         flat_ner: bool = True,
         multi_label: bool = False,
-    ) -> Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]]:
+    ) -> List[Dict[str, Any]] | List[List[Dict[str, Any]]]:
         """Predict entities with conformal-guarantee metadata attached.
 
         Behaves like ``GLiNER.predict_entities``/``batch_predict_entities`` in
@@ -284,7 +308,7 @@ class ConformalGLiNER:
                     tau = self._nc_threshold_for(state, etype)
                     admit_col = (1.0 - probs[b, :, :, col]) <= tau
                 s_idx, k_idx = torch.where(admit_col)
-                for s, k in zip(s_idx.tolist(), k_idx.tolist()):
+                for s, k in zip(s_idx.tolist(), k_idx.tolist(), strict=False):
                     if s + k >= num_tokens[b]:
                         continue
                     score = probs[b, s, k, col].item()
@@ -321,7 +345,7 @@ class ConformalGLiNER:
     # ------------------------------------------------------------------ #
 
     def coverage_report(
-        self, test_data: Sequence[Dict[str, Any]], labels: Optional[Sequence[str]] = None
+        self, test_data: Sequence[Dict[str, Any]], labels: Sequence[str] | None = None
     ) -> Dict[str, Any]:
         """Empirically measure coverage/efficiency on held-out labeled data.
 
@@ -357,7 +381,7 @@ class ConformalGLiNER:
         per_type_n: Dict[str, int] = defaultdict(int)
         n_uncalibrated_gold = 0
         per_example_gold: Dict[int, List[bool]] = defaultdict(list)
-        for s, t, ex_i in zip(scores, types, example_idx):
+        for s, t, ex_i in zip(scores, types, example_idx, strict=False):
             if t not in state.calibrated_types:
                 n_uncalibrated_gold += 1
                 continue

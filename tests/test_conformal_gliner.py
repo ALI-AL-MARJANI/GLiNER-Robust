@@ -285,6 +285,27 @@ class TestPublicThresholdAPI:
         thresholds = cg.thresholds()
         assert len(set(thresholds.values())) == 1
 
+    @pytest.mark.parametrize("mode", ["span_filter", "risk_control", "mondrian"])
+    def test_probability_thresholds_map_nonconformity_to_probability(self, model, calib_data, mode):
+        cg = ConformalGLiNER(model).calibrate(calib_data, alpha=0.2, mode=mode)
+        probability = cg.probability_thresholds(["organization", "person", "location", "date"])
+        for label, tau in cg.thresholds().items():
+            assert probability[label] == pytest.approx(1.0 - tau)
+        assert probability["date"] == 0.5  # uncalibrated label: GLiNER's default rule
+
+    def test_probability_thresholds_drive_core_inference(self, model, calib_data):
+        cg = ConformalGLiNER(model).calibrate(calib_data, alpha=0.2, mode="mondrian")
+        text = "Netflix was founded by Reed Hastings in Los Gatos ."
+        labels = ["organization", "person", "location"]
+
+        core = model.predict_entities(text, labels, threshold=cg.probability_thresholds(labels))
+        wrapped = cg.predict_entities(text, labels)
+
+        def key(ents):
+            return [(e["start"], e["end"], e["label"]) for e in ents]
+
+        assert key(core) == key(wrapped)
+
 
 class TestModelCalibrateConvenienceMethod:
     """Regression coverage for the `model.calibrate()` / `model.conformal` API

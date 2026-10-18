@@ -19,6 +19,7 @@ no solution.
 from __future__ import annotations
 
 import math
+import itertools
 from typing import Dict, Tuple, Mapping, Sequence
 
 
@@ -158,7 +159,7 @@ def crc_lambda_search(
 
     if verify_monotone:
         risks = [_miss_rate(gold_nc_scores, lam) for lam in candidates]
-        for a, b in zip(risks, risks[1:]):
+        for a, b in itertools.pairwise(risks):
             assert a >= b - 1e-12, (
                 "CRC monotonicity precondition violated: empirical risk increased as λ grew. "
                 "This should be structurally impossible for GLiNER's nested-threshold decode "
