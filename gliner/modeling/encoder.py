@@ -1,6 +1,6 @@
 import os
 import warnings
-from typing import Any, Dict, List, Tuple, Union, Optional
+from typing import Any, Dict, List, Tuple
 from pathlib import Path
 
 import torch
@@ -60,7 +60,8 @@ class Transformer(nn.Module):
         config: Any,
         from_pretrained: bool = False,
         labels_encoder: bool = False,
-        cache_dir: Optional[Union[str, Path]] = None,
+        cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
     ) -> None:
         """Initializes the transformer wrapper.
 
@@ -74,6 +75,7 @@ class Transformer(nn.Module):
             labels_encoder: If True, initializes as a labels encoder using
                 `config.labels_encoder_config`. Defaults to False.
             cache_dir: Optional directory for caching downloaded models. Defaults to None.
+            local_files_only: Only load local or cached files.
 
         Raises:
             MissedPackageException: If required packages (llm2vec, peft) are not installed
@@ -85,7 +87,9 @@ class Transformer(nn.Module):
         else:
             encoder_config = config.encoder_config
         if encoder_config is None:
-            encoder_config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir)
+            encoder_config = AutoConfig.from_pretrained(
+                model_name, cache_dir=cache_dir, local_files_only=local_files_only
+            )
             if config.vocab_size != -1:
                 encoder_config.vocab_size = config.vocab_size
 
@@ -124,7 +128,9 @@ class Transformer(nn.Module):
             ModelClass = AutoModel
 
         if from_pretrained:
-            self.model = ModelClass.from_pretrained(model_name, **kwargs, trust_remote_code=True)
+            self.model = ModelClass.from_pretrained(
+                model_name, **kwargs, trust_remote_code=True, cache_dir=cache_dir, local_files_only=local_files_only
+            )
         elif not custom:
             self.model = ModelClass.from_config(encoder_config, trust_remote_code=True)
         else:
@@ -139,7 +145,7 @@ class Transformer(nn.Module):
                     stacklevel=2,
                 )
             else:
-                adapter_config = LoraConfig.from_pretrained(model_name)
+                adapter_config = LoraConfig.from_pretrained(model_name, local_files_only=local_files_only)
                 self.model = get_peft_model(self.model, adapter_config)
 
         if config.fuse_layers:
@@ -174,6 +180,7 @@ class Transformer(nn.Module):
         """
         pair_attention_mask = kwargs.pop("pair_attention_mask", None)
         base_attention_mask = kwargs.pop("attention_mask", None)
+        kwargs.pop("token_lengths", None)  # GLiNER-internal kwarg, not accepted by HF models
         # Extract input_ids if present
         args = list(args)
         input_ids = kwargs.pop("input_ids", None)
@@ -252,9 +259,9 @@ class Transformer(nn.Module):
     def _prepare_pair_attention_masks(
         self,
         pair_attention_mask: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        input_ids: Optional[torch.Tensor],
-        inputs_embeds: Optional[torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
     ) -> Dict[str, torch.Tensor]:
         """Prepares attention masks for packed sequence processing.
 
@@ -327,7 +334,7 @@ class Transformer(nn.Module):
 
     def _forward_deberta(
         self,
-        input_ids: Optional[torch.Tensor],
+        input_ids: torch.Tensor | None,
         model_kwargs: Dict[str, Any],
         mask_info: Dict[str, torch.Tensor],
     ) -> BaseModelOutput:
@@ -427,7 +434,7 @@ class Transformer(nn.Module):
 
     def _forward_modernbert(
         self,
-        input_ids: Optional[torch.Tensor],
+        input_ids: torch.Tensor | None,
         model_kwargs: Dict[str, Any],
         mask_info: Dict[str, torch.Tensor],
     ) -> BaseModelOutput:
@@ -536,7 +543,7 @@ class Transformer(nn.Module):
 
     def _forward_t5(
         self,
-        input_ids: Optional[torch.Tensor],
+        input_ids: torch.Tensor | None,
         model_kwargs: Dict[str, Any],
         mask_info: Dict[str, torch.Tensor],
     ) -> BaseModelOutput:
@@ -681,7 +688,11 @@ class Encoder(nn.Module):
     """
 
     def __init__(
-        self, config: Any, from_pretrained: bool = False, cache_dir: Optional[Union[str, Path]] = None
+        self,
+        config: Any,
+        from_pretrained: bool = False,
+        cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
     ) -> None:
         """Initializes the encoder.
 
@@ -691,17 +702,20 @@ class Encoder(nn.Module):
             from_pretrained: If True, loads pretrained weights for the transformer.
                 Defaults to False.
             cache_dir: Optional directory for caching downloaded models. Defaults to None.
+            local_files_only: Only load local or cached files.
         """
         super().__init__()
 
-        self.bert_layer = Transformer(config.model_name, config, from_pretrained, cache_dir=cache_dir)
+        self.bert_layer = Transformer(
+            config.model_name, config, from_pretrained, cache_dir=cache_dir, local_files_only=local_files_only
+        )
 
         bert_hidden_size = self.bert_layer.model.config.hidden_size
 
         if config.hidden_size != bert_hidden_size:
             self.projection = nn.Linear(bert_hidden_size, config.hidden_size)
 
-    def resize_token_embeddings(self, new_num_tokens: int, pad_to_multiple_of: Optional[int] = None) -> nn.Embedding:
+    def resize_token_embeddings(self, new_num_tokens: int, pad_to_multiple_of: int | None = None) -> nn.Embedding:
         """Resizes token embeddings to accommodate new vocabulary size.
 
         Args:
@@ -742,7 +756,7 @@ class Encoder(nn.Module):
         Returns:
             Token embeddings of shape (batch_size, seq_len, hidden_size).
         """
-        packing_config: Optional[InferencePackingConfig] = kwargs.pop("packing_config", None)
+        packing_config: InferencePackingConfig | None = kwargs.pop("packing_config", None)
         pair_attention_mask = kwargs.pop("pair_attention_mask", None)
         token_lengths = kwargs.pop("token_lengths", None)
 
@@ -782,9 +796,9 @@ class Encoder(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         packing_config: InferencePackingConfig,
-        pair_attention_mask: Optional[torch.Tensor],
+        pair_attention_mask: torch.Tensor | None,
         *args: Any,
-        token_lengths: Optional[List[int]] = None,
+        token_lengths: List[int] | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Encodes sequences using inference-time packing for efficiency.
@@ -823,7 +837,7 @@ class Encoder(nn.Module):
         # One bulk tolist() is cheaper than N per-row tolist() calls.
         all_ids = input_ids.tolist()
         requests = []
-        for ids_row, length in zip(all_ids, lengths):
+        for ids_row, length in zip(all_ids, lengths, strict=False):
             if length <= 0:
                 requests.append({"input_ids": []})
             else:
@@ -895,7 +909,11 @@ class BiEncoder(Encoder):
     """
 
     def __init__(
-        self, config: Any, from_pretrained: bool = False, cache_dir: Optional[Union[str, Path]] = None
+        self,
+        config: Any,
+        from_pretrained: bool = False,
+        cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
     ) -> None:
         """Initializes the bi-encoder.
 
@@ -905,10 +923,18 @@ class BiEncoder(Encoder):
             from_pretrained: If True, loads pretrained weights for both encoders.
                 Defaults to False.
             cache_dir: Optional directory for caching downloaded models. Defaults to None.
+            local_files_only: Only load local or cached files.
         """
-        super().__init__(config, from_pretrained)
+        super().__init__(config, from_pretrained, cache_dir=cache_dir, local_files_only=local_files_only)
         if config.labels_encoder is not None:
-            self.labels_encoder = Transformer(config.labels_encoder, config, from_pretrained, True, cache_dir=cache_dir)
+            self.labels_encoder = Transformer(
+                config.labels_encoder,
+                config,
+                from_pretrained,
+                True,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+            )
             le_hidden_size = self.labels_encoder.model.config.hidden_size
 
             if config.hidden_size != le_hidden_size:
@@ -968,8 +994,8 @@ class BiEncoder(Encoder):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        labels_input_ids: Optional[torch.Tensor] = None,
-        labels_attention_mask: Optional[torch.Tensor] = None,
+        labels_input_ids: torch.Tensor | None = None,
+        labels_attention_mask: torch.Tensor | None = None,
         *args: Any,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, torch.Tensor]:

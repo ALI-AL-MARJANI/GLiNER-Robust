@@ -1,9 +1,12 @@
-from typing import List, Tuple, Union, Optional
+from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
+
+from .utils import extract_prompt_features
+from .context_encoders import build_context_encoder
 
 
 class LstmSeq2SeqEncoder(nn.Module):
@@ -40,8 +43,8 @@ class LstmSeq2SeqEncoder(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor,
-        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        lengths: Optional[Union[List[int], torch.Tensor]] = None,
+        hidden: Tuple[torch.Tensor, torch.Tensor] | None = None,
+        lengths: List[int] | torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encodes input sequences through the LSTM.
 
@@ -71,7 +74,7 @@ class LstmSeq2SeqEncoder(nn.Module):
         return output
 
 
-def create_projection_layer(hidden_size: int, dropout: float, out_dim: Optional[int] = None) -> nn.Sequential:
+def create_projection_layer(hidden_size: int, dropout: float, out_dim: int | None = None) -> nn.Sequential:
     """Creates a two-layer projection network with ReLU activation and dropout.
 
     The projection layer expands the input by 4x in the hidden layer before
@@ -145,10 +148,10 @@ class MultiheadAttention(nn.Module):
     def forward(
         self,
         query: torch.Tensor,
-        key: Optional[torch.Tensor] = None,
-        value: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        attn_mask: Optional[torch.Tensor] = None,
+        key: torch.Tensor | None = None,
+        value: torch.Tensor | None = None,
+        head_mask: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, None]:
         """Computes multi-head attention.
 
@@ -176,11 +179,17 @@ class MultiheadAttention(nn.Module):
         else:
             value = self.transpose_for_scores(self.value_layer(value))
 
+        attention_mask = attn_mask.to(torch.bool) if attn_mask is not None else head_mask
+        # CrossFuser builds masks with shape (B, Q, K). SDPA expects them to
+        # broadcast across the attention-head dimension.
+        if attention_mask is not None and attention_mask.dim() == 3:
+            attention_mask = attention_mask.unsqueeze(1)
+
         context_layer = torch.nn.functional.scaled_dot_product_attention(
             query,
             key,
             value,
-            head_mask,
+            attention_mask,
             self.attention_probs_dropout_prob if self.training else 0.0,
             is_causal=False,
             scale=None,
@@ -229,7 +238,7 @@ class SelfAttentionBlock(nn.Module):
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         """Applies self-attention to input tensor.
 
         Args:
@@ -281,8 +290,8 @@ class CrossAttentionBlock(nn.Module):
         self,
         query: torch.Tensor,
         key: torch.Tensor,
-        value: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
+        value: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Applies cross-attention from query to key-value pairs.
 
@@ -362,8 +371,8 @@ class CrossFuser(nn.Module):
         self,
         query: torch.Tensor,
         key: torch.Tensor,
-        query_mask: Optional[torch.Tensor] = None,
-        key_mask: Optional[torch.Tensor] = None,
+        query_mask: torch.Tensor | None = None,
+        key_mask: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Applies cross-fusion between query and key sequences.
 
@@ -427,7 +436,7 @@ class LayersFuser(nn.Module):
         output_projection: Final projection to output dimension.
     """
 
-    def __init__(self, num_layers: int, hidden_size: int, output_size: Optional[int] = None) -> None:
+    def __init__(self, num_layers: int, hidden_size: int, output_size: int | None = None) -> None:
         """Initializes the layer fusion module.
 
         Args:
@@ -482,3 +491,93 @@ class LayersFuser(nn.Module):
         output = self.output_projection(U_sum)  # [B, L, output_size]
 
         return output
+
+
+class StreamingSpanLabelsEncoder(nn.Module):
+    def __init__(self, config, **kwargs):
+        super().__init__()
+        self.config = config
+        self.encoder_config = config.labels_encoder_config
+        self.encoder = build_context_encoder(
+            self.encoder_config,
+            input_size=config.hidden_size,
+            output_size=config.hidden_size,
+            dropout=config.dropout,
+        )
+
+    def _slice_prompt(self, hidden_states, input_ids, attention_mask):
+        """Compact each prompt from its first valid token through its first separator."""
+        sep_token_id = getattr(self.config, "sep_token_index", -1)
+        if sep_token_id < 0:
+            raise ValueError("StreamingSpanLabelsEncoder requires config.sep_token_index to be set")
+
+        valid_mask = attention_mask.gt(0)
+        sep_mask = input_ids.eq(sep_token_id) & valid_mask
+        has_separator = sep_mask.any(dim=1)
+        if not has_separator.all():
+            missing = (~has_separator).nonzero(as_tuple=True)[0].tolist()
+            raise ValueError(f"No separator token was found for batch rows {missing}")
+
+        batch_size, seq_length, hidden_size = hidden_states.shape
+        positions = torch.arange(seq_length, device=input_ids.device).expand(batch_size, -1)
+        first_valid = positions.masked_fill(~valid_mask, seq_length).amin(dim=1)
+        first_separator = positions.masked_fill(~sep_mask, seq_length).amin(dim=1)
+        prompt_lengths = first_separator - first_valid + 1
+        if (prompt_lengths <= 0).any():
+            invalid = prompt_lengths.le(0).nonzero(as_tuple=True)[0].tolist()
+            raise ValueError(f"Separator token precedes the prompt for batch rows {invalid}")
+
+        max_prompt_length = int(prompt_lengths.max().item())
+        prompt_offsets = torch.arange(max_prompt_length, device=input_ids.device).unsqueeze(0)
+        source_positions = first_valid.unsqueeze(1) + prompt_offsets
+        within_prompt = prompt_offsets < prompt_lengths.unsqueeze(1)
+        safe_positions = source_positions.clamp_max(seq_length - 1)
+
+        prompt_hidden_states = torch.gather(
+            hidden_states,
+            1,
+            safe_positions.unsqueeze(-1).expand(-1, -1, hidden_size),
+        )
+        prompt_input_ids = torch.gather(input_ids, 1, safe_positions)
+        gathered_attention_mask = torch.gather(attention_mask, 1, safe_positions)
+        prompt_attention_mask = gathered_attention_mask.masked_fill(~within_prompt, 0)
+        valid_prompt_mask = within_prompt & prompt_attention_mask.gt(0)
+        prompt_hidden_states = prompt_hidden_states * valid_prompt_mask.unsqueeze(-1)
+        prompt_input_ids = prompt_input_ids.masked_fill(~valid_prompt_mask, 0)
+        return prompt_hidden_states, prompt_input_ids, prompt_attention_mask
+
+    def forward(self, hidden_states, input_ids, attention_mask, **kwargs):
+        """Forward pass.
+
+        Args:
+            hidden_states: (batch_size, seq_length, hidden_size) from decoder backbone
+            input_ids: (batch_size, seq_length)
+            attention_mask: (batch_size, seq_length)
+            **kwargs: Reserved for interface compatibility.
+
+        Returns:
+            Tuple containing:
+                - label representations of shape (batch_size, num_labels, hidden_size)
+                - label mask of shape (batch_size, num_labels)
+        """
+        prompt_hidden_states, prompt_input_ids, prompt_attention_mask = self._slice_prompt(
+            hidden_states,
+            input_ids,
+            attention_mask,
+        )
+        contextualized_hidden_states = self.encoder(
+            prompt_hidden_states,
+            prompt_attention_mask,
+        )
+        if self.config.class_token_index < 0:
+            raise ValueError("StreamingSpanLabelsEncoder requires config.class_token_index to be set")
+        batch_size, _, hidden_size = contextualized_hidden_states.shape
+        return extract_prompt_features(
+            self.config.class_token_index,
+            contextualized_hidden_states,
+            prompt_input_ids,
+            prompt_attention_mask,
+            batch_size,
+            hidden_size,
+            embed_ent_token=True,
+        )

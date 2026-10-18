@@ -1,7 +1,7 @@
 import random
 import warnings
 from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple, Union, Optional, Sequence
+from typing import Dict, List, Tuple, Sequence
 from collections import defaultdict
 
 import torch
@@ -152,9 +152,9 @@ class BaseProcessor(ABC):
     def prepare_inputs(
         self,
         texts: Sequence[Sequence[str]],
-        entities: Union[Sequence[Sequence[str]], Dict[int, Sequence[str]], Sequence[str]],
-        blank: Optional[str] = None,
-        add_entities: Optional[bool] = True,
+        entities: Sequence[Sequence[str]] | Dict[int, Sequence[str]] | Sequence[str],
+        blank: str | None = None,
+        add_entities: bool | None = True,
         **kwargs,
     ) -> Tuple[List[List[str]], List[int]]:
         """Prepare input texts with entity type prompts.
@@ -194,7 +194,8 @@ class BaseProcessor(ABC):
             prompt: List[str] = []
             for ent in ents:
                 prompt.append(self.ent_token)
-                if add_entities:
+                # Empty strings produce no subtokens and must not count as prompt words.
+                if add_entities and str(ent):
                     prompt.append(str(ent))
 
             prompt += self._extra_prompt_tokens(i, text, ents)
@@ -207,8 +208,8 @@ class BaseProcessor(ABC):
     def _select_entities(
         self,
         i: int,
-        entities: Union[Sequence[Sequence[str]], Dict[int, Sequence[str]], Sequence[str]],
-        blank: Optional[str] = None,
+        entities: Sequence[Sequence[str]] | Dict[int, Sequence[str]] | Sequence[str],
+        blank: str | None = None,
     ) -> List[str]:
         """Select entities for a specific example.
 
@@ -270,16 +271,21 @@ class BaseProcessor(ABC):
             tokenized_inputs: Tokenized inputs from transformer tokenizer.
             skip_first_words: Optional list of word counts to skip per example
                 (e.g., prompt words).
-            token_level: If True, create token-level masks instead of word-level.
+            token_level: If True, assign word indices to every subtoken,
+                independently of the configured pooling strategy.
 
         Returns:
             Word mask array.
         """
+        subtoken_pooling = getattr(self.config, "subtoken_pooling", "first")
+        if not isinstance(subtoken_pooling, str):
+            subtoken_pooling = "first"
         return prepare_word_mask(
             texts,
             tokenized_inputs,
             skip_first_words=skip_first_words,
             token_level=token_level,
+            subtoken_pooling=subtoken_pooling,
         )
 
     def tokenize_inputs(self, texts, entities, blank=None, **kwargs):
@@ -312,7 +318,7 @@ class BaseProcessor(ABC):
         return tokenized_inputs
 
     def batch_generate_class_mappings(
-        self, batch_list: List[Dict], negatives: Optional[List[str]] = None, key: str = "ner", sampled_neg: int = 100
+        self, batch_list: List[Dict], negatives: List[str] | None = None, key: str = "ner", sampled_neg: int = 100
     ) -> Tuple[List[Dict[str, int]], List[Dict[int, str]]]:
         """Generate class mappings for a batch with negative sampling.
 
@@ -351,6 +357,10 @@ class BaseProcessor(ABC):
                 random.shuffle(types)
                 types = types[: int(self.config.max_types)]
 
+            if key == "ner" and not b[key] and not types:
+                # Keep one entity marker and an all-negative target for empty examples.
+                types = [""]
+
             class_to_id = {k: v for v, k in enumerate(types, start=1)}
             id_to_class = {k: v for v, k in class_to_id.items()}
             class_to_ids.append(class_to_id)
@@ -361,10 +371,10 @@ class BaseProcessor(ABC):
     def collate_raw_batch(
         self,
         batch_list: List[Dict],
-        entity_types: Optional[List[Union[str, List[str]]]] = None,
-        negatives: Optional[List[str]] = None,
-        class_to_ids: Optional[Union[Dict[str, int], List[Dict[str, int]]]] = None,
-        id_to_classes: Optional[Union[Dict[int, str], List[Dict[int, str]]]] = None,
+        entity_types: List[str | List[str]] | None = None,
+        negatives: List[str] | None = None,
+        class_to_ids: Dict[str, int] | List[Dict[str, int]] | None = None,
+        id_to_classes: Dict[int, str] | List[Dict[int, str]] | None = None,
         key="ner",
     ) -> Dict:
         """Collate a raw batch with optional dynamic or provided label mappings.
@@ -403,7 +413,7 @@ class BaseProcessor(ABC):
             if entity_types and isinstance(entity_types[0], list):
                 # Per-example mappings
                 built = [make_mapping(t) for t in entity_types]  # list of (fwd, rev)
-                class_to_ids, id_to_classes = list(zip(*built))
+                class_to_ids, id_to_classes = list(zip(*built, strict=False))
                 class_to_ids, id_to_classes = list(class_to_ids), list(id_to_classes)
             else:
                 # Single mapping for all examples
@@ -618,6 +628,97 @@ class UniEncoderSpanProcessor(BaseProcessor):
             labels = self.create_labels(batch)
             tokenized_input["labels"] = labels
 
+        return tokenized_input
+
+
+class StreamingSpanProcessor(UniEncoderSpanProcessor):
+    """Span processor for a causal-decoder text backbone.
+
+    Labels are terminated by a marker rather than introduced by one.  This is
+    important for causal backbones: the hidden state at ``<<LABEL>>`` can then
+    attend to all subtokens of the label that precedes it.
+    """
+
+    def __init__(self, config, tokenizer, words_splitter):
+        super().__init__(config, tokenizer, words_splitter)
+        self.label_token = getattr(config, "label_token", "<<LABEL>>")
+
+    def prepare_inputs(
+        self,
+        texts: Sequence[Sequence[str]],
+        entities: Sequence[Sequence[str]] | Dict[int, Sequence[str]] | Sequence[str],
+        blank: str | None = None,
+        add_entities: bool | None = True,
+        include_prompt: bool | Sequence[bool] = True,
+        **kwargs,
+    ) -> Tuple[List[List[str]], List[int]]:
+        """Build ``label<<LABEL>>...<<SEP>>text`` token sequences."""
+        del kwargs
+        include_flags = [include_prompt] * len(texts) if isinstance(include_prompt, bool) else list(include_prompt)
+        if len(include_flags) != len(texts):
+            raise ValueError("include_prompt must match the number of texts")
+
+        input_texts: List[List[str]] = []
+        prompt_lengths: List[int] = []
+        for i, text in enumerate(texts):
+            prompt: List[str] = []
+            if include_flags[i]:
+                ents = self._maybe_remap_entities(self._select_entities(i, entities, blank))
+                for ent in ents:
+                    if add_entities and str(ent):
+                        prompt.append(str(ent))
+                    prompt.append(self.label_token)
+                prompt.append(self.sep_token)
+
+            prompt_lengths.append(len(prompt))
+            input_texts.append(prompt + list(text))
+        return input_texts, prompt_lengths
+
+    def tokenize_inputs(
+        self,
+        texts,
+        entities,
+        blank=None,
+        include_prompt=True,
+        truncation=True,
+        **kwargs,
+    ):
+        """Tokenize without an implicit EOS so cached sessions can be extended."""
+        input_texts, prompt_lengths = self.prepare_inputs(
+            texts,
+            entities,
+            blank=blank,
+            include_prompt=include_prompt,
+            **kwargs,
+        )
+        tokenized_inputs = self.transformer_tokenizer(
+            input_texts,
+            is_split_into_words=True,
+            return_tensors="pt",
+            truncation=truncation,
+            padding="longest",
+            add_special_tokens=False,
+        )
+        words_masks = self.prepare_word_mask(texts, tokenized_inputs, prompt_lengths)
+        tokenized_inputs["words_mask"] = torch.tensor(words_masks)
+        return tokenized_inputs
+
+    def tokenize_and_prepare_labels(
+        self,
+        batch,
+        prepare_labels,
+        *args,
+        include_prompt=True,
+        **kwargs,
+    ):
+        tokenized_input = self.tokenize_inputs(
+            batch["tokens"],
+            batch["classes_to_id"],
+            include_prompt=include_prompt,
+            **kwargs,
+        )
+        if prepare_labels:
+            tokenized_input["labels"] = self.create_labels(batch)
         return tokenized_input
 
 
@@ -973,6 +1074,49 @@ class BaseBiEncoderProcessor(BaseProcessor):
         tokenized_inputs["words_mask"] = torch.tensor(words_masks)
         return tokenized_inputs
 
+    @staticmethod
+    def _prepare_entity_batch(classes_to_id):
+        """Prepare one shared label-encoder input without losing per-row order.
+
+        A bi-encoder can encode the distinct labels in a batch once.  For
+        per-example mappings, the returned gather indices restore those shared
+        embeddings to each example's local (1-indexed) class layout.
+        """
+        if isinstance(classes_to_id, dict):
+            entities = [label for label, _ in sorted(classes_to_id.items(), key=lambda item: item[1])]
+            return entities, None, None
+
+        entity_rows = [
+            [label for label, _ in sorted(mapping.items(), key=lambda item: item[1])] for mapping in classes_to_id
+        ]
+        if not entity_rows:
+            return [], None, None
+        if not any(entity_rows):
+            # Tokenizers generally reject an empty batch. Encode one internal
+            # placeholder, then gather it down to a zero-width class layout.
+            empty_indices = torch.empty(len(entity_rows), 0, dtype=torch.long)
+            empty_mask = torch.empty(len(entity_rows), 0, dtype=torch.bool)
+            return [""], empty_indices, empty_mask
+        if all(row == entity_rows[0] for row in entity_rows[1:]):
+            return entity_rows[0], None, None
+
+        entities = list(dict.fromkeys(label for row in entity_rows for label in row))
+
+        max_classes = max((max(mapping.values(), default=0) for mapping in classes_to_id), default=0)
+        labels_gather_indices = torch.zeros(len(classes_to_id), max_classes, dtype=torch.long)
+        prompts_embedding_mask = torch.zeros(len(classes_to_id), max_classes, dtype=torch.bool)
+
+        entity_to_index = {label: index for index, label in enumerate(entities)}
+        for batch_index, mapping in enumerate(classes_to_id):
+            for label, class_id in mapping.items():
+                class_index = class_id - 1
+                if class_index < 0:
+                    raise ValueError("Bi-encoder class IDs must be positive")
+                labels_gather_indices[batch_index, class_index] = entity_to_index[label]
+                prompts_embedding_mask[batch_index, class_index] = True
+
+        return entities, labels_gather_indices, prompts_embedding_mask
+
     def batch_generate_class_mappings(
         self, batch_list: List[Dict], *args
     ) -> Tuple[List[Dict[str, int]], List[Dict[int, str]]]:
@@ -1006,6 +1150,9 @@ class BaseBiEncoderProcessor(BaseProcessor):
             classes.extend(types)
         random.shuffle(classes)
         classes = list(set(classes))[: int(self.config.max_types * len(batch_list))]
+        if not classes and batch_list and all(not b["ner"] for b in batch_list):
+            # Bi-encoders share candidates, so only an entirely empty pool needs a fallback.
+            classes = [""]
         class_to_id = {k: v for v, k in enumerate(classes, start=1)}
         id_to_class = {k: v for v, k in class_to_id.items()}
 
@@ -1035,14 +1182,16 @@ class BiEncoderSpanProcessor(UniEncoderSpanProcessor, BaseBiEncoderProcessor):
         Returns:
             Dictionary containing tokenized inputs, entity encodings, and optionally labels.
         """
+        labels_gather_indices = None
+        prompts_embedding_mask = None
         if prepare_entities:
-            if isinstance(batch["classes_to_id"], dict):
-                entities = list(batch["classes_to_id"])
-            else:
-                entities = list(batch["classes_to_id"][0])
+            entities, labels_gather_indices, prompts_embedding_mask = self._prepare_entity_batch(batch["classes_to_id"])
         else:
             entities = None
         tokenized_input = self.tokenize_inputs(batch["tokens"], entities)
+        if labels_gather_indices is not None:
+            tokenized_input["labels_gather_indices"] = labels_gather_indices
+            tokenized_input["prompts_embedding_mask"] = prompts_embedding_mask
         if prepare_labels:
             labels = self.create_labels(batch)
             tokenized_input["labels"] = labels
@@ -1068,15 +1217,17 @@ class BiEncoderTokenProcessor(UniEncoderTokenProcessor, BaseBiEncoderProcessor):
         Returns:
             Dictionary containing tokenized inputs, entity encodings, and optionally labels.
         """
+        labels_gather_indices = None
+        prompts_embedding_mask = None
         if prepare_entities:
-            if isinstance(batch["classes_to_id"], dict):
-                entities = list(batch["classes_to_id"])
-            else:
-                entities = list(batch["classes_to_id"][0])
+            entities, labels_gather_indices, prompts_embedding_mask = self._prepare_entity_batch(batch["classes_to_id"])
         else:
             entities = None
 
         tokenized_input = self.tokenize_inputs(batch["tokens"], entities)
+        if labels_gather_indices is not None:
+            tokenized_input["labels_gather_indices"] = labels_gather_indices
+            tokenized_input["prompts_embedding_mask"] = prompts_embedding_mask
 
         if prepare_labels:
             labels = self.create_labels(batch)
@@ -1536,8 +1687,8 @@ class RelationExtractionSpanProcessor(UniEncoderSpanProcessor):
     def batch_generate_class_mappings(
         self,
         batch_list: List[Dict],
-        ner_negatives: Optional[List[str]] = None,
-        rel_negatives: Optional[List[str]] = None,
+        ner_negatives: List[str] | None = None,
+        rel_negatives: List[str] | None = None,
         sampled_neg: int = 100,
     ) -> Tuple[List[Dict[str, int]], List[Dict[int, str]], List[Dict[str, int]], List[Dict[int, str]]]:
         """Generate class mappings for both entities and relations.
@@ -1591,6 +1742,10 @@ class RelationExtractionSpanProcessor(UniEncoderSpanProcessor):
                 random.shuffle(types)
                 types = types[: int(self.config.max_types)]
 
+            if not b["ner"] and not types:
+                # Supply an unnamed NER candidate without inventing relation types.
+                types = [""]
+
             class_to_id = {k: v for v, k in enumerate(types, start=1)}
             id_to_class = {k: v for v, k in class_to_id.items()}
             class_to_ids.append(class_to_id)
@@ -1621,14 +1776,14 @@ class RelationExtractionSpanProcessor(UniEncoderSpanProcessor):
     def collate_raw_batch(
         self,
         batch_list: List[Dict],
-        entity_types: Optional[List[Union[str, List[str]]]] = None,
-        relation_types: Optional[List[Union[str, List[str]]]] = None,
-        ner_negatives: Optional[List[str]] = None,
-        rel_negatives: Optional[List[str]] = None,
-        class_to_ids: Optional[Union[Dict[str, int], List[Dict[str, int]]]] = None,
-        id_to_classes: Optional[Union[Dict[int, str], List[Dict[int, str]]]] = None,
-        rel_class_to_ids: Optional[Union[Dict[str, int], List[Dict[str, int]]]] = None,
-        rel_id_to_classes: Optional[Union[Dict[int, str], List[Dict[int, str]]]] = None,
+        entity_types: List[str | List[str]] | None = None,
+        relation_types: List[str | List[str]] | None = None,
+        ner_negatives: List[str] | None = None,
+        rel_negatives: List[str] | None = None,
+        class_to_ids: Dict[str, int] | List[Dict[str, int]] | None = None,
+        id_to_classes: Dict[int, str] | List[Dict[int, str]] | None = None,
+        rel_class_to_ids: Dict[str, int] | List[Dict[str, int]] | None = None,
+        rel_id_to_classes: Dict[int, str] | List[Dict[int, str]] | None = None,
         key="ner",
     ) -> Dict:
         """Collate a raw batch with entity and relation label mappings.
@@ -1666,7 +1821,7 @@ class RelationExtractionSpanProcessor(UniEncoderSpanProcessor):
             # Build mappings from entity_types
             if entity_types and isinstance(entity_types[0], list):
                 built = [make_mapping(t) for t in entity_types]
-                class_to_ids, id_to_classes = list(zip(*built))
+                class_to_ids, id_to_classes = list(zip(*built, strict=False))
                 class_to_ids, id_to_classes = list(class_to_ids), list(id_to_classes)
             else:
                 class_to_ids, id_to_classes = make_mapping(entity_types or [])
@@ -1674,29 +1829,24 @@ class RelationExtractionSpanProcessor(UniEncoderSpanProcessor):
             # Build relation mappings
             if relation_types and isinstance(relation_types[0], list):
                 built = [make_mapping(t) for t in relation_types]
-                rel_class_to_ids, rel_id_to_classes = list(zip(*built))
+                rel_class_to_ids, rel_id_to_classes = list(zip(*built, strict=False))
                 rel_class_to_ids, rel_id_to_classes = list(rel_class_to_ids), list(rel_id_to_classes)
             else:
                 rel_class_to_ids, rel_id_to_classes = make_mapping(relation_types or [])
 
-        if isinstance(class_to_ids, list):
-            batch = [
+        batch = []
+        for i, example in enumerate(batch_list):
+            class_to_id_i = class_to_ids[i] if isinstance(class_to_ids, list) else class_to_ids
+            rel_class_to_id_i = rel_class_to_ids[i] if isinstance(rel_class_to_ids, list) else rel_class_to_ids
+            batch.append(
                 self.preprocess_example(
-                    b["tokenized_text"],
-                    b[key],
-                    class_to_ids[i],
-                    b.get("relations", []),
-                    rel_class_to_ids[i] if isinstance(rel_class_to_ids, list) else rel_class_to_ids,
+                    example["tokenized_text"],
+                    example[key],
+                    class_to_id_i,
+                    example.get("relations", []),
+                    rel_class_to_id_i,
                 )
-                for i, b in enumerate(batch_list)
-            ]
-        else:
-            batch = [
-                self.preprocess_example(
-                    b["tokenized_text"], b[key], class_to_ids, b.get("relations", []), rel_class_to_ids
-                )
-                for b in batch_list
-            ]
+            )
 
         return self.create_batch_dict(batch, class_to_ids, id_to_classes, rel_class_to_ids, rel_id_to_classes)
 
@@ -1872,7 +2022,7 @@ class RelationExtractionSpanProcessor(UniEncoderSpanProcessor):
         if "span_label" in batch and batch["span_label"] is not None:
             batch_ents = (batch["span_label"] > 0).sum(-1)
         else:
-            batch_ents = span_mask.long().squeeze(-1).sum(-1)
+            batch_ents = span_mask.long().sum(-1)
 
         # Batch CPU transfer to avoid per-element .item() sync
         batch_ents_cpu = batch_ents.tolist()
@@ -2037,9 +2187,9 @@ class RelationExtractionSpanProcessor(UniEncoderSpanProcessor):
     def prepare_inputs(
         self,
         texts: Sequence[Sequence[str]],
-        entities: Union[Sequence[Sequence[str]], Dict[int, Sequence[str]], Sequence[str]],
-        blank: Optional[str] = None,
-        relations: Optional[Union[Sequence[Sequence[str]], Dict[int, Sequence[str]], Sequence[str]]] = None,
+        entities: Sequence[Sequence[str]] | Dict[int, Sequence[str]] | Sequence[str],
+        blank: str | None = None,
+        relations: Sequence[Sequence[str]] | Dict[int, Sequence[str]] | Sequence[str] | None = None,
         **kwargs,
     ) -> Tuple[List[List[str]], List[int]]:
         """Prepare input texts with entity and relation type prompts.
@@ -2078,7 +2228,9 @@ class RelationExtractionSpanProcessor(UniEncoderSpanProcessor):
 
             prompt: List[str] = []
             for ent in ents:
-                prompt += [self.ent_token, str(ent)]
+                prompt.append(self.ent_token)
+                if str(ent):
+                    prompt.append(str(ent))
             prompt.append(self.sep_token)
 
             for rel in rels:

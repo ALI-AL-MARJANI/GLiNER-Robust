@@ -1,14 +1,13 @@
-import os
 import re
 import json
 import logging
 import warnings
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Tuple, Union, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Mapping, Optional
 from pathlib import Path
+from threading import RLock
 
 import torch
-import onnxruntime as ort
 import transformers
 from tqdm import tqdm
 from torch import nn
@@ -23,6 +22,7 @@ from huggingface_hub import (
 )
 from torch.utils.data import DataLoader
 from safetensors.torch import save_file
+from torch.nn.utils.rnn import pad_sequence
 from huggingface_hub.errors import EntryNotFoundError
 
 try:
@@ -35,6 +35,7 @@ from .config import (
     GLiNERConfig,
     BaseGLiNERConfig,
     BiEncoderSpanConfig,
+    StreamingSpanConfig,
     BiEncoderTokenConfig,
     UniEncoderSpanConfig,
     UniEncoderTokenConfig,
@@ -43,6 +44,7 @@ from .config import (
     UniEncoderSpanDecoderConfig,
     UniEncoderTokenDecoderConfig,
 )
+from .runtime import OpenVINOModel, BaseRuntimeModel, ONNXRuntimeModel
 from .decoding import (
     SpanDecoder,
     TokenDecoder,
@@ -51,22 +53,14 @@ from .decoding import (
     SpanGenerativeDecoder,
     TokenGenerativeDecoder,
 )
-from .training import Trainer, TrainingArguments
+from .streaming import StreamingBatch, AsyncStreamingEngine, _PersistentBatchState
 from .evaluation import BaseNEREvaluator, BaseRelexEvaluator
-from .onnx.model import (
-    BaseORTModel,
-    BiEncoderSpanORTModel,
-    BiEncoderTokenORTModel,
-    UniEncoderSpanORTModel,
-    UniEncoderTokenORTModel,
-    UniEncoderSpanRelexORTModel,
-    UniEncoderTokenRelexORTModel,
-)
 from .decoding.trie import LabelsTrie
 from .infer_packing import InferencePackingConfig
 from .modeling.base import (
     BaseModel,
     BiEncoderSpanModel,
+    StreamingSpanModel,
     BiEncoderTokenModel,
     UniEncoderSpanModel,
     UniEncoderTokenModel,
@@ -75,10 +69,19 @@ from .modeling.base import (
     UniEncoderSpanDecoderModel,
     UniEncoderTokenDecoderModel,
 )
+from .modeling.cache import (
+    DEFAULT_CACHE_INITIAL_CAPACITY,
+    CacheState,
+    SessionCacheManager,
+    create_reusable_cache,
+    split_past_key_values,
+    stack_past_key_values,
+)
 from .modeling.utils import extract_prompt_features
 from .data_processing import (
     BaseProcessor,
     BiEncoderSpanProcessor,
+    StreamingSpanProcessor,
     BiEncoderTokenProcessor,
     UniEncoderSpanProcessor,
     UniEncoderTokenProcessor,
@@ -87,8 +90,10 @@ from .data_processing import (
     UniEncoderTokenDecoderProcessor,
     RelationExtractionTokenProcessor,
 )
+from .data_processing.utils import prepare_streaming_span_idx
 from .data_processing.collator import (
     BiEncoderSpanDataCollator,
+    StreamingSpanDataCollator,
     BiEncoderTokenDataCollator,
     UniEncoderSpanDataCollator,
     UniEncoderTokenDataCollator,
@@ -99,12 +104,281 @@ from .data_processing.collator import (
 )
 from .data_processing.tokenizer import WordsSplitter
 
-if is_module_available("onnxruntime"):
-    import onnxruntime as ort
+EntityLabels = str | List[str] | Mapping[str, str] | List[List[str]] | List[Mapping[str, str]]
 
-    ONNX_AVAILABLE = True
-else:
-    ONNX_AVAILABLE = False
+
+def _normalize_label_set(labels):
+    """Return model-facing prompts and the corresponding public label names."""
+    if isinstance(labels, Mapping):
+        prompts = []
+        names = []
+        for name, prompt in labels.items():
+            if not isinstance(name, str) or not isinstance(prompt, str):
+                raise TypeError("Label description mappings must contain only string keys and values")
+            names.append(name)
+            prompts.append(prompt)
+        if len(set(prompts)) != len(prompts):
+            raise ValueError("Label descriptions must be unique within each label set")
+        return prompts, names
+
+    if isinstance(labels, str):
+        labels = [labels]
+
+    normalized = list(dict.fromkeys(labels))
+    return normalized, normalized
+
+
+def _normalize_labels(labels, num_texts, valid_to_orig_idx):
+    """Normalize shared or per-text labels while preserving empty-text alignment."""
+    is_per_text = (
+        isinstance(labels, list)
+        and bool(labels)
+        and any(isinstance(label_set, (list, Mapping)) for label_set in labels)
+    )
+    if not is_per_text:
+        return _normalize_label_set(labels)
+
+    if len(labels) != num_texts:
+        raise ValueError(f"Per-text labels must have length {num_texts}, got {len(labels)}")
+    if not all(isinstance(label_set, (list, Mapping)) for label_set in labels):
+        raise TypeError("Per-text labels must contain only lists or label description mappings")
+
+    normalized = [_normalize_label_set(label_set) for label_set in labels]
+    prompts = [normalized[index][0] for index in valid_to_orig_idx]
+    names = [normalized[index][1] for index in valid_to_orig_idx]
+    return prompts, names
+
+
+def _has_label_descriptions(labels):
+    return isinstance(labels, Mapping) or (
+        isinstance(labels, list) and any(isinstance(label_set, Mapping) for label_set in labels)
+    )
+
+
+def _entity_types_for_chunk(entity_types, indices):
+    """Select the label sets belonging to the rows in one DataLoader chunk.
+
+    ``entity_types`` is either a single flat list shared by every row, or -- when ``inference`` is
+    called with ``labels=List[List[str]]`` -- one list per row. Only the per-row form may be
+    sliced; slicing the shared form would silently drop labels.
+    """
+    if entity_types and isinstance(entity_types[0], list):
+        return [entity_types[i] for i in indices]
+    return entity_types
+
+
+def _remap_id_to_classes(batch, entity_types, label_names):
+    """Replace prompt text in decoder mappings with public label names."""
+    id_to_classes = batch.get("id_to_classes")
+    if id_to_classes is None or label_names is None:
+        return
+
+    mappings = id_to_classes if isinstance(id_to_classes, list) else [id_to_classes]
+    per_text = bool(entity_types) and isinstance(entity_types[0], list)
+    prompt_sets = entity_types if per_text else [entity_types] * len(mappings)
+    name_sets = label_names if per_text else [label_names] * len(mappings)
+
+    remapped = []
+    for mapping, prompts, names in zip(mappings, prompt_sets, name_sets, strict=False):
+        prompt_to_name = dict(zip(prompts, names, strict=False))
+        remapped.append({class_id: prompt_to_name.get(prompt, prompt) for class_id, prompt in mapping.items()})
+
+    batch["id_to_classes"] = remapped if isinstance(id_to_classes, list) else remapped[0]
+
+
+def _model_output_tensor(model_output, name: str) -> torch.Tensor | None:
+    """Return an optional model-output value as a torch tensor."""
+    value = getattr(model_output, name, None)
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value
+    return torch.as_tensor(value)
+
+
+def _assign_vector_rows(requests, attribute: str) -> None:
+    """Bulk-copy selected embedding rows to decoded objects as float32 NumPy views."""
+    if not requests:
+        return
+    objects, tensors = zip(*requests, strict=False)
+    values = torch.stack(tensors).detach().to(device="cpu", dtype=torch.float32).numpy()
+    for obj, value in zip(objects, values, strict=False):
+        setattr(obj, attribute, value)
+
+
+def _assign_vector_tensor(objects, values: torch.Tensor, attribute: str) -> None:
+    """Bulk-copy an already stacked embedding tensor to decoded objects."""
+    if not objects:
+        return
+    numpy_values = values.detach().to(device="cpu", dtype=torch.float32).numpy()
+    for obj, value in zip(objects, numpy_values, strict=False):
+        setattr(obj, attribute, value)
+
+
+def _attach_entity_vectors(
+    decoded: List[List[Any]],
+    model_output: Any,
+    config: Any,
+    return_vectors: bool,
+    return_label_vectors: bool,
+) -> None:
+    """Attach requested entity and label representations to final decoded spans."""
+    if not return_vectors and not return_label_vectors:
+        return
+    if not any(decoded):
+        return
+
+    words_embedding = _model_output_tensor(model_output, "words_embedding")
+    prompts_embedding = _model_output_tensor(model_output, "prompts_embedding")
+    span_embeddings = _model_output_tensor(model_output, "span_embeddings")
+    is_token_level = getattr(config, "span_mode", None) == "token_level"
+
+    if return_vectors and is_token_level and words_embedding is None:
+        raise RuntimeError("Token-level span vectors require words_embedding in the model output")
+    if return_vectors and not is_token_level and span_embeddings is None:
+        raise RuntimeError("Span vectors require span_embeddings in the model output")
+    if return_label_vectors and prompts_embedding is None:
+        raise RuntimeError("Label vectors require prompts_embedding in the model output")
+
+    flattened_span_embeddings = None
+    if return_vectors and not is_token_level:
+        if span_embeddings.ndim == 4:
+            flattened_span_embeddings = span_embeddings.flatten(1, 2)
+        elif span_embeddings.ndim == 3:
+            flattened_span_embeddings = span_embeddings
+        else:
+            raise RuntimeError(
+                "span_embeddings must have shape [batch, spans, hidden] or [batch, words, widths, hidden]"
+            )
+
+    vector_objects = []
+    vector_batch_indices = []
+    vector_span_indices = []
+    vector_starts = []
+    vector_ends = []
+    label_objects = []
+    label_batch_indices = []
+    label_class_indices = []
+    for batch_index, spans in enumerate(decoded):
+        for span in spans:
+            if return_vectors:
+                if is_token_level:
+                    if span.start < 0 or span.end < span.start or span.end >= words_embedding.size(1):
+                        raise RuntimeError(f"Decoded span [{span.start}, {span.end}] is outside the word embeddings")
+                    vector_starts.append(span.start)
+                    vector_ends.append(span.end)
+                else:
+                    span_index = getattr(span, "span_index", None)
+                    if span_index is None:
+                        raise RuntimeError("Decoded span is missing its model span index")
+                    vector_span_indices.append(span_index)
+                vector_objects.append(span)
+                vector_batch_indices.append(batch_index)
+
+            if return_label_vectors:
+                class_index = getattr(span, "class_index", None)
+                if class_index is None:
+                    raise RuntimeError("Decoded span is missing its model class index")
+                label_objects.append(span)
+                label_batch_indices.append(batch_index)
+                label_class_indices.append(class_index)
+
+    if vector_objects:
+        vector_batches = torch.tensor(
+            vector_batch_indices,
+            dtype=torch.long,
+            device=words_embedding.device if is_token_level else span_embeddings.device,
+        )
+        if is_token_level:
+            starts = torch.tensor(vector_starts, dtype=torch.long, device=words_embedding.device)
+            ends = torch.tensor(vector_ends, dtype=torch.long, device=words_embedding.device)
+            prefix = words_embedding.cumsum(dim=1, dtype=torch.float32)
+            prefix = torch.cat((torch.zeros_like(prefix[:, :1]), prefix), dim=1)
+            vector_values = prefix[vector_batches, ends + 1] - prefix[vector_batches, starts]
+            vector_values = vector_values / (ends - starts + 1).unsqueeze(-1)
+        else:
+            span_indices = torch.tensor(vector_span_indices, dtype=torch.long, device=span_embeddings.device)
+            vector_values = flattened_span_embeddings[vector_batches, span_indices]
+        _assign_vector_tensor(vector_objects, vector_values, "vector")
+
+    if label_objects:
+        label_batches = torch.tensor(label_batch_indices, dtype=torch.long, device=prompts_embedding.device)
+        label_indices = torch.tensor(label_class_indices, dtype=torch.long, device=prompts_embedding.device)
+        _assign_vector_tensor(label_objects, prompts_embedding[label_batches, label_indices], "label_vector")
+
+
+def _attach_relation_vectors(
+    decoded_relations: List[List[Any]],
+    model_output: Any,
+    return_vectors: bool,
+    return_label_vectors: bool,
+) -> None:
+    """Attach scorer-side representations to final decoded relations."""
+    if not return_vectors and not return_label_vectors:
+        return
+    if not any(decoded_relations):
+        return
+
+    relation_embeddings = _model_output_tensor(model_output, "relation_embeddings")
+    relation_head_embeddings = _model_output_tensor(model_output, "relation_head_embeddings")
+    relation_tail_embeddings = _model_output_tensor(model_output, "relation_tail_embeddings")
+    relation_prompts = _model_output_tensor(model_output, "rel_prompts_embedding")
+
+    if (
+        return_vectors
+        and relation_embeddings is None
+        and (relation_head_embeddings is None or relation_tail_embeddings is None)
+    ):
+        raise RuntimeError("Relation vectors require relation representations in the model output")
+    if return_label_vectors and relation_prompts is None:
+        raise RuntimeError("Relation label vectors require rel_prompts_embedding in the model output")
+
+    vector_requests = []
+    head_requests = []
+    tail_requests = []
+    label_requests = []
+    for batch_index, relations in enumerate(decoded_relations):
+        for relation in relations:
+            pair_index = getattr(relation, "pair_index", None)
+            class_index = getattr(relation, "class_index", None)
+            if return_vectors and pair_index is None:
+                raise RuntimeError("Decoded relation is missing its model pair index")
+
+            if return_vectors:
+                if relation_embeddings is not None:
+                    vector_requests.append((relation, relation_embeddings[batch_index, pair_index]))
+                else:
+                    head_requests.append((relation, relation_head_embeddings[batch_index, pair_index]))
+                    tail_requests.append((relation, relation_tail_embeddings[batch_index, pair_index]))
+
+            if return_label_vectors:
+                if class_index is None:
+                    raise RuntimeError("Decoded relation is missing its model class index")
+                label_requests.append((relation, relation_prompts[batch_index, class_index]))
+
+    _assign_vector_rows(vector_requests, "vector")
+    _assign_vector_rows(head_requests, "head_relation_vector")
+    _assign_vector_rows(tail_requests, "tail_relation_vector")
+    _assign_vector_rows(label_requests, "label_vector")
+
+
+def _get_trainer_classes():
+    """Lazily import Trainer/TrainingArguments.
+
+    transformers.Trainer triggers a torch.distributed import that deadlocks on
+    macOS ARM when multiple OpenMP runtimes are present -- only load it when
+    train_model()/create_training_args() are actually called.
+    """
+    from .training import Trainer, TrainingArguments  # noqa: PLC0415
+
+    return Trainer, TrainingArguments
+
+
+if TYPE_CHECKING:
+    # Only for static analysis / IDEs -- see _get_trainer_classes for why this
+    # isn't a real top-level import.
+    from .training import Trainer, TrainingArguments
+
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +386,6 @@ logger = logging.getLogger(__name__)
 class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
     config_class: type = None
     model_class: type = None
-    ort_model_class: type = None
     data_processor_class: type = None
     data_collator_class: type = None
     decoder_class: type = None
@@ -120,11 +393,12 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
     def __init__(
         self,
         config: BaseGLiNERConfig,
-        model: Optional[BaseModel] = None,
-        tokenizer: Optional[BaseModel] = None,
-        data_processor: Optional[BaseProcessor] = None,
-        backbone_from_pretrained: Optional[bool] = False,
-        cache_dir: Optional[Union[str, Path]] = None,
+        model: BaseModel | BaseRuntimeModel | None = None,
+        tokenizer: BaseModel | None = None,
+        data_processor: BaseProcessor | None = None,
+        backbone_from_pretrained: bool | None = False,
+        cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
         **kwargs,
     ):
         """Initialize a BaseGLiNER model.
@@ -136,6 +410,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
             data_processor: Pre-initialized data processor. If None, creates a new processor.
             backbone_from_pretrained: Whether to load the backbone from pretrained weights.
             cache_dir: Directory for caching downloaded models.
+            local_files_only: Only load local or cached files.
             **kwargs: Additional keyword arguments passed to model creation.
         """
         super().__init__()
@@ -144,22 +419,31 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         if model is not None:
             self.model = model
         else:
-            self.model = self._create_model(config, backbone_from_pretrained, cache_dir, **kwargs)
+            self.model = self._create_model(
+                config, backbone_from_pretrained, cache_dir, local_files_only=local_files_only, **kwargs
+            )
 
         if data_processor is not None:
             self.data_processor = data_processor
         else:
-            self.data_processor = self._create_data_processor(config, cache_dir, tokenizer, **kwargs)
+            self.data_processor = self._create_data_processor(
+                config, cache_dir, tokenizer, local_files_only=local_files_only, **kwargs
+            )
 
-        if isinstance(self.model, BaseORTModel):
-            self.onnx_model = True
+        if isinstance(self.model, BaseRuntimeModel):
+            self.runtime = self.model.runtime_name
+            self.runtime_model = True
         else:
-            self.onnx_model = False
+            self.runtime = "torch"
+            self.runtime_model = False
+        # Backwards-compatible public state. Internal control flow must use
+        # ``runtime_model`` because OpenVINO has the same host-input behavior.
+        self.onnx_model = self.runtime == "onnxruntime"
 
         self.decoder = self.decoder_class(config)
 
         self._keys_to_ignore_on_save = None
-        self._inference_packing_config: Optional[InferencePackingConfig] = None
+        self._inference_packing_config: InferencePackingConfig | None = None
 
     @abstractmethod
     def _create_model(self, config, backbone_from_pretrained, cache_dir, **kwargs):
@@ -213,15 +497,21 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         Returns:
             Torch device object (CPU or CUDA).
         """
-        if self.onnx_model:
-            providers = self.model.session.get_providers()
-            if "CUDAExecutionProvider" in providers:
-                return torch.device("cuda")
-            return torch.device("cpu")
+        if self.is_runtime_model:
+            return self.model.device
         device = next(self.model.parameters()).device
         return device
 
-    def configure_inference_packing(self, config: Optional[InferencePackingConfig]) -> None:
+    @property
+    def is_runtime_model(self) -> bool:
+        """Whether inference is delegated to ONNX Runtime or OpenVINO.
+
+        The legacy fallback keeps lightweight subclasses and integrations that
+        set only ``onnx_model`` working during the namespace migration.
+        """
+        return bool(getattr(self, "runtime_model", False) or getattr(self, "onnx_model", False))
+
+    def configure_inference_packing(self, config: InferencePackingConfig | None) -> None:
         """Configure default packing behavior for inference calls.
 
         Passing ``None`` disables packing by default. Individual inference
@@ -248,6 +538,12 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         wrapped with ``torch.compiler.disable`` so the rest of the model
         (span representation, scoring, etc.) still benefits from compilation.
         """
+        if self.is_runtime_model:
+            raise RuntimeError(
+                "torch.compile is only available for PyTorch-backed models; "
+                "configure optimization through the selected external runtime instead."
+            )
+
         torch._dynamo.config.capture_scalar_outputs = True
 
         # FlashDeBERTa uses hand-written Triton kernels that torch.compile cannot trace.
@@ -290,8 +586,83 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         "bfloat16": "bf16",
     }
 
+    _RUNTIME_ALIASES = {
+        "torch": "torch",
+        "pytorch": "torch",
+        "onnx": "onnxruntime",
+        "ort": "onnxruntime",
+        "onnxruntime": "onnxruntime",
+        "ov": "openvino",
+        "openvino": "openvino",
+    }
+
     @classmethod
-    def _normalize_variant(cls, variant) -> Optional[str]:
+    def _normalize_runtime(cls, runtime: str | None, load_onnx_model: bool = False) -> str:
+        """Resolve the canonical inference runtime, including legacy ONNX arguments."""
+        if runtime is None:
+            return "onnxruntime" if load_onnx_model else "torch"
+        if not isinstance(runtime, str):
+            raise TypeError(f"runtime must be str or None, got {type(runtime).__name__}")
+
+        key = runtime.lower()
+        if key not in cls._RUNTIME_ALIASES:
+            raise ValueError(
+                f"Unknown runtime {runtime!r}. Supported runtimes are 'torch', 'onnxruntime', and 'openvino'."
+            )
+
+        normalized = cls._RUNTIME_ALIASES[key]
+        if load_onnx_model and normalized != "onnxruntime":
+            raise ValueError(
+                "load_onnx_model=True conflicts with "
+                f"runtime={runtime!r}; use runtime='onnxruntime' or remove the legacy argument."
+            )
+        return normalized
+
+    @staticmethod
+    def _validate_runtime_only_options(
+        runtime: str,
+        *,
+        variant,
+        dtype,
+        quantize,
+        compile_torch_model: bool,
+        low_cpu_mem_usage: bool,
+    ) -> None:
+        """Reject PyTorch-only loading options for external runtime artifacts."""
+        if runtime == "torch":
+            return
+
+        incompatible = []
+        if variant is not None:
+            incompatible.append("variant")
+        if dtype is not None:
+            incompatible.append("dtype")
+        if quantize is not None:
+            incompatible.append("quantize")
+        if compile_torch_model:
+            incompatible.append("compile_torch_model")
+        if low_cpu_mem_usage:
+            incompatible.append("low_cpu_mem_usage")
+        if incompatible:
+            joined = ", ".join(incompatible)
+            raise ValueError(f"{joined} only apply to the PyTorch runtime; selected runtime={runtime!r}.")
+
+    @staticmethod
+    def _validate_runtime_architecture(config: BaseGLiNERConfig, runtime: str) -> None:
+        """Reject architectures that cannot be represented by one exported graph."""
+        if runtime == "torch":
+            return
+
+        is_streaming = isinstance(config, StreamingSpanConfig) or getattr(config, "model_type", None) == (
+            "gliner_streaming_span"
+        )
+        has_generative_decoder = getattr(config, "labels_decoder", None) is not None
+        if is_streaming or has_generative_decoder:
+            architecture = "streaming" if is_streaming else "generative-decoder"
+            raise NotImplementedError(f"The {runtime!r} runtime does not support {architecture} GLiNER architectures.")
+
+    @classmethod
+    def _normalize_variant(cls, variant) -> str | None:
         """Canonicalize a variant string to ``"fp16"``, ``"bf16"``, or ``None``.
 
         ``None`` selects the default (fp32) ``model.safetensors``. Anything
@@ -346,11 +717,11 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         cls,
         model_id: str,
         variant: str,
-        revision: Optional[str] = None,
-        cache_dir: Optional[Union[str, Path]] = None,
-        token: Union[str, bool, None] = None,
+        revision: str | None = None,
+        cache_dir: str | Path | None = None,
+        token: str | bool | None = None,
         local_files_only: bool = False,
-    ) -> Optional[bool]:
+    ) -> bool | None:
         """Probe whether ``model.{variant}.safetensors`` is published.
 
         Resolution order (matches the ``transformers`` / ``huggingface_hub``
@@ -421,12 +792,12 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
     def _resolve_variant(
         cls,
         model_id: str,
-        variant: Optional[str],
-        revision: Optional[str] = None,
-        cache_dir: Optional[Union[str, Path]] = None,
-        token: Union[str, bool, None] = None,
+        variant: str | None,
+        revision: str | None = None,
+        cache_dir: str | Path | None = None,
+        token: str | bool | None = None,
         local_files_only: bool = False,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Probe for variant availability; warn and fall back to ``None`` if missing.
 
         When the publisher has uploaded ``model.{variant}.safetensors`` this
@@ -469,7 +840,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         return variant
 
     @classmethod
-    def _resolve_model_file(cls, model_dir: Path, variant: Optional[str]) -> tuple:
+    def _resolve_model_file(cls, model_dir: Path, variant: str | None) -> tuple:
         """Pick the model file on disk, with graceful fallback if variant is missing.
 
         Returns ``(model_file: Path, effective_variant: Optional[str])``.
@@ -509,7 +880,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         return model_file, None
 
     @classmethod
-    def _parse_dtype(cls, dtype) -> Optional[torch.dtype]:
+    def _parse_dtype(cls, dtype) -> torch.dtype | None:
         if dtype is None:
             return None
         if isinstance(dtype, torch.dtype):
@@ -558,10 +929,10 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
             >>> # For precision-only changes, prefer:
             >>> model = GLiNER.from_pretrained("urchade/gliner_small-v2.1", dtype="bf16")
         """
-        if self.onnx_model:
+        if self.is_runtime_model:
             raise RuntimeError(
-                "Cannot apply PyTorch quantization to an ONNX model. "
-                "Use export_to_onnx(quantize=True) for ONNX quantization."
+                "Cannot apply PyTorch quantization to an ONNX/OpenVINO runtime-backed model. "
+                "Quantize the exported artifact with tooling for the selected runtime."
             )
 
         if not isinstance(dtype, str):
@@ -636,16 +1007,78 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
             new_state_dict[_key] = tensor
         return new_state_dict
 
+    @staticmethod
+    def _prepare_safetensors_state_dict(state_dict):
+        """Make a state dict safe to serialize without duplicating tied weights.
+
+        ``safetensors.torch.save_model`` handles exact parameter aliases, but it
+        rejects tensors that cover only part of their backing storage. CUDA RNN
+        flattening can leave LSTM parameters in exactly that form after the
+        first forward pass. This helper preserves exact aliases as metadata and
+        clones only tensors whose storage layout cannot be saved directly.
+
+        Returns:
+            A tuple of ``(tensors, metadata)`` suitable for ``save_file``.
+        """
+        tensors = {}
+        metadata = {}
+        aliases = {}
+        retained_storages = set()
+
+        for name, tensor in state_dict.items():
+            if not torch.is_tensor(tensor):
+                raise TypeError(f"State dict entry {name!r} is not a tensor: {type(tensor).__name__}")
+
+            storage_key = None
+            alias_key = None
+            if tensor.device.type != "meta" and tensor.layout == torch.strided and tensor.numel() > 0:
+                storage = tensor.untyped_storage()
+                storage_key = (tensor.device, storage.data_ptr(), storage.nbytes())
+                alias_key = (
+                    *storage_key,
+                    tensor.data_ptr(),
+                    tensor.storage_offset(),
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    tensor.dtype,
+                )
+
+            kept_name = aliases.get(alias_key) if alias_key is not None else None
+            if kept_name is not None:
+                metadata[name] = kept_name
+                continue
+            if alias_key is not None:
+                aliases[alias_key] = name
+
+            must_clone = not tensor.is_contiguous()
+            if storage_key is not None:
+                storage = tensor.untyped_storage()
+                covers_storage = (
+                    tensor.data_ptr() == storage.data_ptr()
+                    and tensor.numel() * tensor.element_size() == storage.nbytes()
+                )
+                must_clone = must_clone or not covers_storage or storage_key in retained_storages
+                if not must_clone:
+                    retained_storages.add(storage_key)
+
+            tensor_to_save = tensor
+            if must_clone:
+                tensor_to_save = tensor.detach().clone(memory_format=torch.contiguous_format)
+
+            tensors[name] = tensor_to_save
+
+        return tensors, metadata
+
     def save_pretrained(
         self,
-        save_directory: Union[str, Path],
+        save_directory: str | Path,
         *,
-        config: Optional[BaseGLiNERConfig] = None,
-        repo_id: Optional[str] = None,
+        config: BaseGLiNERConfig | None = None,
+        repo_id: str | None = None,
         push_to_hub: bool = False,
         safe_serialization: bool = False,
         **push_to_hub_kwargs,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Save model weights and configuration to local directory.
 
         Args:
@@ -659,15 +1092,28 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         Returns:
             Repository URL if pushed to hub, None otherwise.
         """
+        if self.is_runtime_model:
+            raise RuntimeError(
+                "save_pretrained() is only available for PyTorch-backed models. "
+                "Copy the runtime artifact, GLiNER config, and tokenizer files together instead."
+            )
+
         save_directory = Path(save_directory)
         save_directory.mkdir(parents=True, exist_ok=True)
 
-        # Save model weights
-        model_state_dict = self.prepare_state_dict(self.model.state_dict())
-
         if safe_serialization:
-            save_file(model_state_dict, save_directory / "model.safetensors")
+            # Saving the original module avoids leaking torch.compile's
+            # ``_orig_mod.`` prefix into checkpoint keys.
+            model_to_save = getattr(self.model, "_orig_mod", self.model)
+            model_state_dict = self.prepare_state_dict(model_to_save.state_dict())
+            model_state_dict, metadata = self._prepare_safetensors_state_dict(model_state_dict)
+            save_file(
+                model_state_dict,
+                save_directory / "model.safetensors",
+                metadata=metadata or None,
+            )
         else:
+            model_state_dict = self.prepare_state_dict(self.model.state_dict())
             torch.save(model_state_dict, save_directory / "pytorch_model.bin")
 
         # Save config
@@ -678,6 +1124,10 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
 
         # Save tokenizer
         self.data_processor.transformer_tokenizer.save_pretrained(save_directory)
+        for name in ("labels_tokenizer", "decoder_tokenizer"):
+            auxiliary_tokenizer = getattr(self.data_processor, name, None)
+            if auxiliary_tokenizer is not None:
+                auxiliary_tokenizer.save_pretrained(save_directory / name)
 
         # Push to hub if requested
         if push_to_hub:
@@ -736,11 +1186,16 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         return tokenizer
 
     @classmethod
+    def _get_tokenizer_source(cls, config: GLiNERConfig) -> str:
+        """Return the model identifier used to initialize the input tokenizer."""
+        return config.model_name
+
+    @classmethod
     def _load_tokenizer(
         cls,
         config: GLiNERConfig,
         model_dir: Path,
-        cache_dir: Optional[Path] = None,
+        cache_dir: Path | None = None,
         local_files_only: bool = False,
     ):
         """
@@ -761,7 +1216,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
             tokenizer = AutoTokenizer.from_pretrained(model_dir, cache_dir=cache_dir, local_files_only=local_files_only)
         else:
             tokenizer = AutoTokenizer.from_pretrained(
-                config.model_name,
+                cls._get_tokenizer_source(config),
                 cache_dir=cache_dir,
                 local_files_only=local_files_only,
             )
@@ -822,7 +1277,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         cls,
         model_file: Path,
         map_location: str = "cpu",
-        dtype: Optional[torch.dtype] = None,
+        dtype: torch.dtype | None = None,
     ):
         """
         Load state dict from file.
@@ -840,11 +1295,22 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         if model_file.suffix == ".safetensors" or str(model_file).endswith(".safetensors"):
             state_dict = {}
             with safe_open(model_file, framework="pt", device=map_location) as f:
+                metadata = f.metadata() or {}
                 for key in f.keys():  # noqa: SIM118
                     tensor = f.get_tensor(key)
                     if dtype is not None and tensor.is_floating_point() and tensor.dtype != dtype:
                         tensor = tensor.to(dtype)
                     state_dict[key] = tensor
+
+            # ``safetensors.torch.save_model`` stores every omitted shared
+            # tensor as metadata[omitted_name] = saved_name. Recreate those
+            # aliases so the existing PyTorch load paths, including strict and
+            # meta-device loading, continue to receive a complete state dict.
+            # Other metadata (for example {"format": "pt"}) is ignored because
+            # its value is not a tensor name in the checkpoint.
+            for omitted_name, saved_name in metadata.items():
+                if omitted_name not in state_dict and saved_name in state_dict:
+                    state_dict[omitted_name] = state_dict[saved_name]
         else:
             state_dict = torch.load(model_file, map_location=torch.device(map_location), weights_only=True)
             if dtype is not None:
@@ -857,14 +1323,14 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
     def _download_model(
         cls,
         model_id: str,
-        revision: Optional[str] = None,
-        cache_dir: Optional[Union[str, Path]] = None,
+        revision: str | None = None,
+        cache_dir: str | Path | None = None,
         force_download: bool = False,
-        proxies: Optional[dict] = None,
+        proxies: dict | None = None,
         resume_download: bool = False,
-        token: Union[str, bool, None] = None,
+        token: str | bool | None = None,
         local_files_only: bool = False,
-        variant: Optional[str] = None,
+        variant: str | None = None,
     ) -> Path:
         """
         Download model from HuggingFace Hub or use local directory.
@@ -907,30 +1373,121 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         return model_dir
 
     @staticmethod
+    def _token_missing_from_tokenizer(tokenizer, token: str) -> bool:
+        """Check whether a special token is absent from the tokenizer vocabulary.
+
+        A token is considered missing when it cannot be converted to an id, or
+        when it silently maps to the unknown-token id.
+        """
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is None:
+            return True
+        unk_token_id = getattr(tokenizer, "unk_token_id", None)
+        return unk_token_id is not None and token_id == unk_token_id and token != getattr(tokenizer, "unk_token", None)
+
+    @classmethod
+    def validate_special_token_config(cls, config_instance, tokenizer) -> None:
+        """Validate explicit ``class_token_index``/``vocab_size`` against the tokenizer.
+
+        When these values are hardcoded in the config, GLiNER trusts them and does
+        not add its special tokens (``ent_token``, ``sep_token``). If the tokenizer
+        does not actually contain those tokens, the class-token mask never matches
+        and training proceeds with ``loss=0`` without any error (see issue #332).
+        This check fails fast with actionable guidance instead.
+
+        Args:
+            config_instance: Model configuration with explicit special-token indices.
+            tokenizer: The transformer tokenizer that will be used by the model.
+
+        Raises:
+            ValueError: If ``class_token_index`` is out of range for the tokenizer,
+                or if ``ent_token`` is missing from the tokenizer vocabulary.
+        """
+        tokenizer_size = len(tokenizer)
+
+        if not (0 <= config_instance.class_token_index < tokenizer_size):
+            raise ValueError(
+                f"class_token_index={config_instance.class_token_index} is out of range for the "
+                f"tokenizer (len={tokenizer_size}). The configured index assumes GLiNER special "
+                f"tokens that are not present in this tokenizer. Set class_token_index: -1 and "
+                f"vocab_size: -1 in your config to let GLiNER add the special tokens and detect "
+                f"the indices automatically."
+            )
+
+        ent_token = getattr(config_instance, "ent_token", None)
+        if ent_token is not None and cls._token_missing_from_tokenizer(tokenizer, ent_token):
+            raise ValueError(
+                f"The entity marker token {ent_token!r} is not present in the tokenizer "
+                f"vocabulary, but class_token_index={config_instance.class_token_index} and "
+                f"vocab_size={config_instance.vocab_size} are set explicitly. Training in this "
+                f"state produces an empty entity prompt and a constant zero loss. Set "
+                f"class_token_index: -1 and vocab_size: -1 in your config so GLiNER adds "
+                f"{ent_token!r} and detects its index automatically."
+            )
+
+        for optional_token_attr in ("sep_token", "rel_token"):
+            optional_token = getattr(config_instance, optional_token_attr, None)
+            if optional_token is not None and cls._token_missing_from_tokenizer(tokenizer, optional_token):
+                warnings.warn(
+                    f"The special token {optional_token!r} ({optional_token_attr}) is not present "
+                    f"in the tokenizer vocabulary. Prompts will be built from its subword pieces, "
+                    f"which can degrade quality. Consider setting class_token_index: -1 and "
+                    f"vocab_size: -1 so GLiNER adds all special tokens automatically.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        if ent_token is not None:
+            ent_token_id = tokenizer.convert_tokens_to_ids(ent_token)
+            if ent_token_id is not None and ent_token_id != config_instance.class_token_index:
+                warnings.warn(
+                    f"class_token_index={config_instance.class_token_index} does not match the "
+                    f"tokenizer id of {ent_token!r} ({ent_token_id}). The class-token mask will "
+                    f"match a different token, which can silently disable learning.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        if config_instance.vocab_size != tokenizer_size:
+            warnings.warn(
+                f"config.vocab_size={config_instance.vocab_size} differs from the tokenizer size "
+                f"({tokenizer_size}). Embedding lookups may be misaligned or fail at runtime.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    @staticmethod
     def _resize_token_embeddings(instance, config_instance, tokenizer, resize_token_embeddings=True):
         add_tokens = instance._get_special_tokens()
+        missing_architecture_indices = getattr(config_instance, "sep_token_index", 0) == -1
         # Resize token embeddings if needed
-        if resize_token_embeddings and (config_instance.class_token_index == -1 or config_instance.vocab_size == -1):
+        if resize_token_embeddings and (
+            config_instance.class_token_index == -1 or config_instance.vocab_size == -1 or missing_architecture_indices
+        ):
             if tokenizer is not None:
                 tokenizer.add_tokens(add_tokens, special_tokens=True)
             instance.resize_embeddings()
+        elif tokenizer is not None and config_instance.class_token_index != -1 and config_instance.vocab_size != -1:
+            # Explicit indices: verify they are consistent with the tokenizer to
+            # avoid silent zero-loss training (issue #332).
+            instance.validate_special_token_config(config_instance, tokenizer)
 
     @classmethod
     def load_from_config(
         cls,
-        config: Union[str, Path, GLiNERConfig, dict],
-        cache_dir: Optional[Union[str, Path]] = None,
+        config: str | Path | GLiNERConfig | dict,
+        cache_dir: str | Path | None = None,
         load_tokenizer: bool = True,
         resize_token_embeddings: bool = True,
         backbone_from_pretrained: bool = True,
         compile_torch_model: bool = False,
-        quantize: Optional[str] = None,
+        quantize: str | None = None,
         map_location: str = "cpu",
         # Config overrides
-        max_length: Optional[int] = None,
-        max_width: Optional[int] = None,
-        post_fusion_schema: Optional[str] = None,
-        _attn_implementation: Optional[str] = None,
+        max_length: int | None = None,
+        max_width: int | None = None,
+        post_fusion_schema: str | None = None,
+        _attn_implementation: str | None = None,
         **model_kwargs,
     ):
         """Initialize a model from configuration without loading pretrained weights.
@@ -999,7 +1556,11 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         # Load tokenizer if requested
         tokenizer = None
         if load_tokenizer:
-            tokenizer = AutoTokenizer.from_pretrained(config_instance.model_name, cache_dir=cache_dir)
+            tokenizer = AutoTokenizer.from_pretrained(
+                cls._get_tokenizer_source(config_instance),
+                cache_dir=cache_dir,
+                local_files_only=model_kwargs.get("local_files_only", False),
+            )
             cls._set_tokenizer_spec_tokens(tokenizer)
         # Create model instance from scratch
         instance = cls(
@@ -1034,34 +1595,38 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         return instance
 
     @classmethod
-    def from_pretrained(
+    # Keep positional compatibility for downstream callers of this public loading API.
+    def from_pretrained(  # noqa: PLR0917, RUF100
         cls,
         model_id: str,
-        model_dir: Optional[str] = None,
-        revision: Optional[str] = None,
-        cache_dir: Optional[Union[str, Path]] = None,
+        model_dir: str | None = None,
+        revision: str | None = None,
+        cache_dir: str | Path | None = None,
         force_download: bool = False,
-        proxies: Optional[dict] = None,
+        proxies: dict | None = None,
         resume_download: bool = False,
         local_files_only: bool = False,
-        token: Union[str, bool, None] = None,
+        token: str | bool | None = None,
         map_location: str = "cpu",
         strict: bool = False,
-        load_tokenizer: Optional[bool] = None,
-        resize_token_embeddings: Optional[bool] = True,
-        compile_torch_model: Optional[bool] = False,
-        quantize: Optional[str] = None,
-        dtype: Optional[Union[str, torch.dtype]] = None,
+        load_tokenizer: bool | None = None,
+        resize_token_embeddings: bool | None = True,
+        compile_torch_model: bool | None = False,
+        quantize: str | None = None,
+        dtype: str | torch.dtype | None = None,
         low_cpu_mem_usage: bool = False,
-        variant: Optional[str] = None,
-        load_onnx_model: Optional[bool] = False,
-        onnx_model_file: Optional[str] = "model.onnx",
+        variant: str | None = None,
+        load_onnx_model: bool | None = False,
+        onnx_model_file: str | None = "model.onnx",
         session_options=None,
         # Config overrides
-        max_length: Optional[int] = None,
-        max_width: Optional[int] = None,
-        post_fusion_schema: Optional[str] = None,
-        _attn_implementation: Optional[str] = None,
+        max_length: int | None = None,
+        max_width: int | None = None,
+        post_fusion_schema: str | None = None,
+        _attn_implementation: str | None = None,
+        runtime: str | None = None,
+        runtime_model_file: str | None = None,
+        runtime_options: dict | None = None,
         **model_kwargs,
     ):
         """Load pretrained model from HuggingFace Hub or local directory.
@@ -1117,16 +1682,36 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
             max_width: Override max_width in config.
             post_fusion_schema: Override post_fusion_schema in config.
             _attn_implementation: Override attention implementation.
+            runtime: Inference runtime: ``"torch"``, ``"onnxruntime"``, or
+                ``"openvino"``. ``None`` preserves the legacy
+                ``load_onnx_model`` behavior.
+            runtime_model_file: Runtime artifact relative to the model directory.
+                Both ONNX Runtime and OpenVINO can load ``model.onnx``;
+                OpenVINO also accepts an IR ``.xml`` file with its matching ``.bin``.
+            runtime_options: Backend-specific construction options. ONNX Runtime
+                accepts ``session``, ``session_options``, and ``providers``;
+                OpenVINO accepts ``compiled_model``, ``device_name``, ``config``,
+                and ``core``.
             **model_kwargs: Additional model initialization arguments.
 
         Returns:
             Loaded model instance.
         """
+        runtime = cls._normalize_runtime(runtime, load_onnx_model=bool(load_onnx_model))
+        cls._validate_runtime_only_options(
+            runtime,
+            variant=variant,
+            dtype=dtype,
+            quantize=quantize,
+            compile_torch_model=bool(compile_torch_model),
+            low_cpu_mem_usage=low_cpu_mem_usage,
+        )
+
         # Resolve variant + dtype up front so the download path can be
         # narrowed *before* hitting the network. Must happen before any
         # snapshot_download call so allow_patterns can apply.
-        variant = cls._normalize_variant(variant)
-        torch_dtype = cls._parse_dtype(dtype)
+        variant = cls._normalize_variant(variant) if runtime == "torch" else None
+        torch_dtype = cls._parse_dtype(dtype) if runtime == "torch" else None
         if variant is not None:
             variant_dtype = cls._VARIANT_TO_DTYPE[variant]
             if torch_dtype is None:
@@ -1166,6 +1751,8 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
                 local_files_only,
                 variant=variant,
             )
+        else:
+            model_dir = Path(model_dir)
 
         # Load config
         config_file = model_dir / "gliner_config.json"
@@ -1179,6 +1766,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
             post_fusion_schema=post_fusion_schema,
             _attn_implementation=_attn_implementation,
         )
+        cls._validate_runtime_architecture(config, runtime)
 
         # Load tokenizer
         if load_tokenizer is None:
@@ -1188,7 +1776,15 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         if load_tokenizer:
             tokenizer = cls._load_tokenizer(config, model_dir, cache_dir, local_files_only=local_files_only)
 
-        if not load_onnx_model:
+        # Auxiliary tokenizers saved with the model take precedence over Hub identifiers.
+        for name in ("labels_tokenizer", "decoder_tokenizer"):
+            tokenizer_dir = model_dir / name
+            if name not in model_kwargs and (tokenizer_dir / "tokenizer_config.json").is_file():
+                model_kwargs[name] = AutoTokenizer.from_pretrained(
+                    tokenizer_dir, cache_dir=cache_dir, local_files_only=local_files_only
+                )
+
+        if runtime == "torch":
             # Find the model file. _resolve_model_file picks the variant file
             # if present, falls back to the default fp32 file with a warning if
             # the variant is missing (e.g. caller passed model_dir directly to
@@ -1206,6 +1802,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
                         config,
                         tokenizer=tokenizer,
                         backbone_from_pretrained=False,
+                        local_files_only=local_files_only,
                         cache_dir=cache_dir,
                         **model_kwargs,
                     )
@@ -1281,6 +1878,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
                     config,
                     tokenizer=tokenizer,
                     backbone_from_pretrained=False,
+                    local_files_only=local_files_only,
                     cache_dir=cache_dir,
                     **model_kwargs,
                 )
@@ -1313,37 +1911,97 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
 
             instance.eval()
         else:
-            model_file = model_dir / onnx_model_file
-            if not os.path.exists(model_file):
-                raise FileNotFoundError(f"The ONNX model can't be loaded from {model_file}.")
-            if session_options is None:
-                session_options = ort.SessionOptions()
-                session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            providers = ["CPUExecutionProvider"]
-            if "cuda" in map_location:
-                if not torch.cuda.is_available():
-                    raise RuntimeError("CUDA is not available but `map_location` is set to 'cuda'.")
-                providers = ["CUDAExecutionProvider"]
-            ort_session = ort.InferenceSession(model_file, session_options, providers=providers)
-            model = cls.ort_model_class(ort_session)
-            instance = cls(config, tokenizer=tokenizer, model=model)
+            if runtime_options is None:
+                options = {}
+            elif isinstance(runtime_options, dict):
+                options = runtime_options.copy()
+            else:
+                raise TypeError(f"runtime_options must be a dictionary or None, got {type(runtime_options).__name__}")
+
+            if runtime_model_file is not None and onnx_model_file not in {None, "model.onnx", runtime_model_file}:
+                raise ValueError(
+                    "runtime_model_file conflicts with the legacy onnx_model_file argument; provide only one."
+                )
+            artifact_name = runtime_model_file or onnx_model_file or "model.onnx"
+            model_file = model_dir / artifact_name
+
+            if runtime == "onnxruntime":
+                injected_session = options.pop("session", None)
+                option_session_options = options.pop("session_options", None)
+                if session_options is not None and option_session_options is not None:
+                    raise ValueError(
+                        "session_options was provided both directly and through runtime_options; provide only one."
+                    )
+                effective_session_options = (
+                    option_session_options if option_session_options is not None else session_options
+                )
+                providers = options.pop("providers", None)
+                if providers is None and injected_session is None:
+                    providers = ["CPUExecutionProvider"]
+                    if "cuda" in map_location:
+                        if not torch.cuda.is_available():
+                            raise RuntimeError("CUDA is not available but `map_location` is set to 'cuda'.")
+                        providers = ["CUDAExecutionProvider"]
+                if options:
+                    raise ValueError(f"Unknown ONNX Runtime options: {sorted(options)}")
+                if injected_session is None and not model_file.exists():
+                    raise FileNotFoundError(f"The ONNX model can't be loaded from {model_file}.")
+                model = ONNXRuntimeModel(
+                    session=injected_session,
+                    model_path=None if injected_session is not None else model_file,
+                    session_options=effective_session_options,
+                    providers=providers,
+                )
+            else:
+                if session_options is not None:
+                    raise ValueError(
+                        "session_options only applies to ONNX Runtime; pass OpenVINO compile properties in "
+                        "runtime_options['config']."
+                    )
+                if str(map_location).lower() != "cpu":
+                    raise ValueError(
+                        "map_location does not select an OpenVINO device; use "
+                        "runtime_options={'device_name': 'GPU'} (or CPU/AUTO/NPU)."
+                    )
+                compiled_model = options.pop("compiled_model", None)
+                device_name = options.pop("device_name", "CPU")
+                compile_config = options.pop("config", None)
+                core = options.pop("core", None)
+                if options:
+                    raise ValueError(f"Unknown OpenVINO options: {sorted(options)}")
+                if compiled_model is None and not model_file.exists():
+                    raise FileNotFoundError(f"The OpenVINO model can't be loaded from {model_file}.")
+                model = OpenVINOModel(
+                    compiled_model=compiled_model,
+                    model_path=None if compiled_model is not None else model_file,
+                    device_name=device_name,
+                    config=compile_config,
+                    core=core,
+                )
+
+            instance = cls(
+                config,
+                tokenizer=tokenizer,
+                model=model,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                **model_kwargs,
+            )
 
         return instance
 
-    def _check_onnx_export_preconditions(self):
-        if self.onnx_model:
+    def _check_export_preconditions(self):
+        if self.is_runtime_model:
             raise RuntimeError(
-                "This instance already wraps an ONNX/ORT model. Export is intended for PyTorch-based models."
+                "This instance already wraps an external runtime model. Export is intended for PyTorch-based models."
             )
-        if not ONNX_AVAILABLE:
-            raise RuntimeError("onnxruntime is not available. Install `onnxruntime` to export to ONNX.")
         if not hasattr(self, "data_processor") or not hasattr(self, "data_collator_class"):
             raise RuntimeError("Model is not fully initialized (missing data_processor or data_collator).")
 
     def _build_dummy_batch(
         self,
-        labels: Optional[list[str]] = None,
-        text: str = "ONNX export dummy input.",
+        labels: list[str] | None = None,
+        text: str = "Model export dummy input.",
     ) -> dict[str, torch.Tensor]:
         """
         Build a single CPU batch using the model's own preprocessing stack.
@@ -1412,7 +2070,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         onnx_path: Path,
         quantized_path: Path,
         quantize: bool,
-    ) -> Optional[Path]:
+    ) -> Path | None:
         if not quantize:
             return None
 
@@ -1497,15 +2155,24 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         all_inputs = tuple(batch[name] for name in spec["input_names"])
         return all_inputs, spec
 
+    def _prepare_export_graph(self, **export_kwargs) -> tuple[nn.Module, tuple, dict[str, Any]]:
+        """Build the wrapped PyTorch graph and example inputs shared by model exporters."""
+        batch_kwargs = {**self._get_onnx_export_kwargs(), **export_kwargs}
+        batch = self._build_dummy_batch(**batch_kwargs)
+        core = self.model.to("cpu").eval()
+        all_inputs, spec = self._prepare_onnx_batch(batch, **export_kwargs)
+        wrapper = self._create_onnx_wrapper(core).eval()
+        return wrapper, all_inputs, spec
+
     def export_to_onnx(
         self,
-        save_dir: Union[str, Path],
+        save_dir: str | Path,
         onnx_filename: str = "model.onnx",
         quantized_filename: str = "model_quantized.onnx",
         quantize: bool = False,
         opset: int = 19,
         **export_kwargs,
-    ) -> dict[str, Optional[str]]:
+    ) -> dict[str, str | None]:
         """Unified ONNX export method using specifications from child classes.
 
         Args:
@@ -1521,23 +2188,12 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
                 - onnx_path: Path to standard ONNX model
                 - quantized_path: Path to quantized model (if quantize=True)
         """
-        self._check_onnx_export_preconditions()
-
+        self._check_export_preconditions()
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         onnx_path = save_dir / onnx_filename
 
-        # Merge export kwargs with model-specific kwargs
-        batch_kwargs = {**self._get_onnx_export_kwargs(), **export_kwargs}
-        batch = self._build_dummy_batch(**batch_kwargs)
-
-        core = self.model.to("cpu").eval()
-
-        # Prepare inputs and get spec (allows for dynamic modification)
-        all_inputs, spec = self._prepare_onnx_batch(batch, **export_kwargs)
-
-        # Create wrapper
-        wrapper = self._create_onnx_wrapper(core)
+        wrapper, all_inputs, spec = self._prepare_export_graph(**export_kwargs)
 
         # Export
         self._run_torch_onnx_export(
@@ -1561,6 +2217,62 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         return {
             "onnx_path": str(onnx_path),
             "quantized_path": str(q_path) if q_path is not None else None,
+        }
+
+    def export_to_openvino(
+        self,
+        save_dir: str | Path,
+        openvino_filename: str = "model.xml",
+        *,
+        compress_to_fp16: bool = False,
+        **export_kwargs,
+    ) -> dict[str, str]:
+        """Convert the PyTorch model directly to OpenVINO IR.
+
+        Args:
+            save_dir: Directory in which to save the model and tokenizer files.
+            openvino_filename: Name of the OpenVINO IR ``.xml`` file.
+            compress_to_fp16: Whether OpenVINO should compress floating-point weights to FP16.
+            **export_kwargs: Additional model-specific export arguments.
+
+        Returns:
+            Paths to the OpenVINO graph and weights under ``openvino_path`` and
+            ``weights_path``.
+        """
+        save_dir = Path(save_dir)
+        openvino_path = save_dir / openvino_filename
+        if openvino_path.suffix.lower() != ".xml":
+            raise ValueError(f"OpenVINO IR file must use the .xml extension: {openvino_path}")
+        self._check_export_preconditions()
+
+        from .runtime.openvino import _require_openvino  # noqa: PLC0415
+
+        ov = _require_openvino()
+        wrapper, example_inputs, spec = self._prepare_export_graph(**export_kwargs)
+
+        input_shapes = []
+        for name, value in zip(spec["input_names"], example_inputs, strict=True):
+            dynamic_axes = spec["dynamic_axes"].get(name, {})
+            shape = ov.PartialShape(
+                [-1 if axis in dynamic_axes else int(size) for axis, size in enumerate(value.shape)]
+            )
+            input_shapes.append(shape)
+
+        openvino_model = ov.convert_model(wrapper, example_input=example_inputs, input=input_shapes)
+        for port, name in zip(openvino_model.inputs, spec["input_names"], strict=True):
+            port.get_tensor().set_names({name})
+        for port, name in zip(openvino_model.outputs, spec["output_names"], strict=True):
+            port.get_tensor().set_names({name})
+
+        save_dir.mkdir(parents=True, exist_ok=True)
+        openvino_path.parent.mkdir(parents=True, exist_ok=True)
+        ov.save_model(openvino_model, openvino_path, compress_to_fp16=compress_to_fp16)
+        self.config.to_json_file(save_dir / "gliner_config.json")
+        self.data_processor.transformer_tokenizer.save_pretrained(save_dir)
+
+        return {
+            "openvino_path": str(openvino_path),
+            "weights_path": str(openvino_path.with_suffix(".bin")),
         }
 
     def _create_data_collator(self, **kwargs):
@@ -1591,7 +2303,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
 
         # Labels encoder (optional)
         if (
-            self.config.labels_encoder is not None
+            getattr(self.config, "labels_encoder", None) is not None
             and hasattr(self.model, "token_rep_layer")
             and hasattr(self.model.token_rep_layer, "labels_encoder")
         ):
@@ -1599,7 +2311,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
 
         # Decoder (optional)
         if (
-            self.config.labels_decoder is not None
+            getattr(self.config, "labels_decoder", None) is not None
             and hasattr(self.model, "decoder")
             and hasattr(self.model.decoder, "decoder_layer")
         ):
@@ -1638,17 +2350,18 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
             warnings.warn(f"Component '{component_name}' not found. Available components: {available}", stacklevel=2)
 
     @classmethod
-    def create_training_args(
+    # Keep positional compatibility for downstream callers of this public training API.
+    def create_training_args(  # noqa: PLR0917, RUF100
         cls,
-        output_dir: Union[str, Path],
+        output_dir: str | Path,
         learning_rate: float = 5e-5,
         weight_decay: float = 0.01,
-        others_lr: Optional[float] = None,
-        others_weight_decay: Optional[float] = None,
+        others_lr: float | None = None,
+        others_weight_decay: float | None = None,
         focal_loss_alpha: float = -1,
         focal_loss_gamma: float = 0.0,
-        rel_focal_loss_alpha: Optional[float] = None,
-        rel_focal_loss_gamma: Optional[float] = None,
+        rel_focal_loss_alpha: float | None = None,
+        rel_focal_loss_gamma: float | None = None,
         focal_loss_prob_margin: float = 0.0,
         loss_reduction: str = "sum",
         negatives: float = 1.0,
@@ -1667,7 +2380,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         dataloader_num_workers: int = 1,
         report_to: str = "none",
         **kwargs,
-    ) -> TrainingArguments:
+    ) -> "TrainingArguments":
         """Create training arguments with sensible defaults.
 
         Args:
@@ -1702,6 +2415,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         Returns:
             TrainingArguments instance.
         """
+        _, TrainingArguments = _get_trainer_classes()
         return TrainingArguments(
             output_dir=output_dir,
             learning_rate=learning_rate,
@@ -1736,12 +2450,12 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         self,
         train_dataset,
         eval_dataset,
-        training_args: Optional[TrainingArguments] = None,
-        freeze_components: Optional[list[str]] = None,
+        training_args: Optional["TrainingArguments"] = None,
+        freeze_components: list[str] | None = None,
         compile_model: bool = False,
-        output_dir: Optional[Union[str, Path]] = None,
+        output_dir: str | Path | None = None,
         **training_kwargs,
-    ) -> Trainer:
+    ) -> "Trainer":
         """Train the model.
 
         Args:
@@ -1789,6 +2503,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         else:
             trainer_kwargs["processing_class"] = self.data_processor.transformer_tokenizer
 
+        Trainer, _ = _get_trainer_classes()
         trainer = Trainer(**trainer_kwargs)
 
         # Train
@@ -1799,12 +2514,19 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
 
 class BaseEncoderGLiNER(BaseGLiNER):
     def _create_model(self, config, backbone_from_pretrained, cache_dir, **kwargs):
-        self.model = self.model_class(config, backbone_from_pretrained, cache_dir=cache_dir, **kwargs)
+        model_kwargs = {
+            key: value for key, value in kwargs.items() if key not in {"labels_tokenizer", "decoder_tokenizer"}
+        }
+        self.model = self.model_class(config, backbone_from_pretrained, cache_dir=cache_dir, **model_kwargs)
         return self.model
 
-    def _create_data_processor(self, config, cache_dir, tokenizer=None, words_splitter=None, **kwargs):
+    def _create_data_processor(
+        self, config, cache_dir, tokenizer=None, words_splitter=None, local_files_only=False, **kwargs
+    ):
         if tokenizer is None:
-            tokenizer = AutoTokenizer.from_pretrained(config.model_name, cache_dir=cache_dir)
+            tokenizer = AutoTokenizer.from_pretrained(
+                config.model_name, cache_dir=cache_dir, local_files_only=local_files_only
+            )
             self._set_tokenizer_spec_tokens(tokenizer)
         self.data_processor = self.data_processor_class(config, tokenizer, words_splitter)
         return self.data_processor
@@ -1973,6 +2695,12 @@ class BaseEncoderGLiNER(BaseGLiNER):
                 if span.class_probs is not None:
                     entity["class_probs"] = span.class_probs
 
+                if getattr(span, "vector", None) is not None:
+                    entity["vector"] = span.vector
+
+                if getattr(span, "label_vector", None) is not None:
+                    entity["label_vector"] = span.label_vector
+
                 entities.append(entity)
 
             all_entities[orig_i] = entities
@@ -1988,6 +2716,8 @@ class BaseEncoderGLiNER(BaseGLiNER):
         packing_config=None,
         return_class_probs=False,
         word_input_spans=None,
+        return_vectors=False,
+        return_label_vectors=False,
         **external_inputs,
     ):
         """Shared batch processing logic using modular run_batch and decode_batch."""
@@ -1995,13 +2725,15 @@ class BaseEncoderGLiNER(BaseGLiNER):
         batch_offset = 0
 
         for batch in data_loader:
-            model_output = self.run_batch(
-                batch,
-                threshold=threshold,
-                packing_config=packing_config,
-                move_to_device=True,
+            run_kwargs = {
+                "threshold": threshold,
+                "packing_config": packing_config,
+                "move_to_device": True,
                 **external_inputs,
-            )
+            }
+            if return_vectors:
+                run_kwargs["return_vectors"] = True
+            model_output = self.run_batch(batch, **run_kwargs)
 
             batch_input_spans = None
             if word_input_spans is not None:
@@ -2009,24 +2741,27 @@ class BaseEncoderGLiNER(BaseGLiNER):
                 batch_input_spans = word_input_spans[batch_offset : batch_offset + current_batch_size]
                 batch_offset += current_batch_size
 
-            decoded = self.decode_batch(
-                model_output,
-                batch,
-                threshold=threshold,
-                flat_ner=flat_ner,
-                multi_label=multi_label,
-                return_class_probs=return_class_probs,
-                input_spans=batch_input_spans,
-            )
+            decode_kwargs = {
+                "threshold": threshold,
+                "flat_ner": flat_ner,
+                "multi_label": multi_label,
+                "return_class_probs": return_class_probs,
+                "input_spans": batch_input_spans,
+            }
+            if return_vectors:
+                decode_kwargs["return_vectors"] = True
+            if return_label_vectors:
+                decode_kwargs["return_label_vectors"] = True
+            decoded = self.decode_batch(model_output, batch, **decode_kwargs)
             outputs.extend(decoded)
 
         return outputs
 
     def prepare_batch(
         self,
-        texts: Union[str, List[str]],
-        labels: Union[str, List[str], List[List[str]]],
-        input_spans: Optional[List[List[Dict]]] = None,
+        texts: str | List[str],
+        labels: EntityLabels,
+        input_spans: List[List[Dict]] | None = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """Prepare raw inputs for inference (tokenization and normalization).
@@ -2036,7 +2771,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
 
         Args:
             texts: Single text string or list of texts.
-            labels: Entity labels - string, list of strings, or per-text label lists.
+            labels: Entity labels as strings, a label-to-description mapping, or per-text label sets.
             input_spans: Optional pre-defined spans to classify (character positions).
             **kwargs: Additional keyword arguments passed to the data processor.
 
@@ -2047,7 +2782,8 @@ class BaseEncoderGLiNER(BaseGLiNER):
                 - start_token_map: Per-text mapping from token idx to char start
                 - end_token_map: Per-text mapping from token idx to char end
                 - word_input_spans: Spans converted to word indices (or None)
-                - entity_types: Normalized entity types
+                - entity_types: Model-facing entity prompts
+                - label_names: Public entity label names
                 - valid_texts: Non-empty texts that will be processed
                 - valid_to_orig_idx: Mapping from valid indices to original indices
                 - num_original: Total number of original texts
@@ -2055,8 +2791,14 @@ class BaseEncoderGLiNER(BaseGLiNER):
         if isinstance(texts, str):
             texts = [texts]
 
+        if getattr(getattr(self, "config", None), "precomputed_prompts_mode", False) and _has_label_descriptions(
+            labels
+        ):
+            raise ValueError("Label descriptions are not supported with precomputed prompt embeddings")
+
         num_original = len(texts)
         valid_texts, valid_to_orig_idx = self._filter_valid_texts(texts)
+        entity_types, label_names = _normalize_labels(labels, num_original, valid_to_orig_idx)
 
         if not valid_texts:
             return {
@@ -2066,20 +2808,11 @@ class BaseEncoderGLiNER(BaseGLiNER):
                 "end_token_map": [],
                 "word_input_spans": None,
                 "entity_types": [],
+                "label_names": [],
                 "valid_texts": [],
                 "valid_to_orig_idx": [],
                 "num_original": num_original,
             }
-
-        if isinstance(labels, str):
-            entity_types = list(dict.fromkeys([labels]))
-        elif labels and isinstance(labels[0], list):
-            if len(labels) != num_original:
-                raise ValueError(f"Per-text labels must have length {num_original}, got {len(labels)}")
-            all_entity_types = [list(dict.fromkeys(lbls)) for lbls in labels]
-            entity_types = [all_entity_types[i] for i in valid_to_orig_idx]
-        else:
-            entity_types = list(dict.fromkeys(labels))
 
         tokens, start_token_map, end_token_map = self.prepare_inputs(valid_texts)
 
@@ -2097,6 +2830,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
             "end_token_map": end_token_map,
             "word_input_spans": word_input_spans,
             "entity_types": entity_types,
+            "label_names": label_names,
             "valid_texts": valid_texts,
             "valid_to_orig_idx": valid_to_orig_idx,
             "num_original": num_original,
@@ -2105,8 +2839,9 @@ class BaseEncoderGLiNER(BaseGLiNER):
     def collate_batch(
         self,
         input_x: List[Dict[str, Any]],
-        entity_types: Union[List[str], List[List[str]]],
-        collator: Optional[Any] = None,
+        entity_types: List[str] | List[List[str]],
+        collator: Any | None = None,
+        label_names: List[str] | List[List[str]] | None = None,
     ) -> Dict[str, Any]:
         """Collate prepared inputs into a tensor batch.
 
@@ -2114,6 +2849,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
             input_x: List of input dicts from prepare_batch.
             entity_types: Entity type labels.
             collator: Optional pre-created collator instance. If None, creates one.
+            label_names: Optional public names corresponding to model-facing entity prompts.
 
         Returns:
             Collated batch dictionary with tensors ready for the model.
@@ -2129,6 +2865,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
             )
 
         batch = collator(input_x, entity_types=entity_types)
+        _remap_id_to_classes(batch, entity_types, label_names)
         return batch
 
     @torch.inference_mode()
@@ -2136,8 +2873,9 @@ class BaseEncoderGLiNER(BaseGLiNER):
         self,
         batch: Dict[str, Any],
         threshold: float = 0.5,
-        packing_config: Optional[InferencePackingConfig] = None,
+        packing_config: InferencePackingConfig | None = None,
         move_to_device: bool = True,
+        return_vectors: bool = False,
         **external_inputs,
     ) -> Any:
         """Run model forward pass on a collated batch.
@@ -2147,12 +2885,24 @@ class BaseEncoderGLiNER(BaseGLiNER):
             threshold: Confidence threshold for predictions.
             packing_config: Optional inference packing configuration.
             move_to_device: Whether to move tensors to model device.
+            return_vectors: Whether to retain span representations for decoding.
             **external_inputs: Additional inputs to pass to the model.
 
         Returns:
             Model output containing logits and span information.
         """
-        if move_to_device and not self.onnx_model:
+        labels_gather_indices = batch.get("labels_gather_indices")
+        if (
+            self.is_runtime_model
+            and isinstance(labels_gather_indices, torch.Tensor)
+            and labels_gather_indices.shape[0] > 1
+        ):
+            raise ValueError(
+                "Batched per-row labels are not supported by existing bi-encoder ONNX graphs; "
+                "use inference() or collate singleton batches"
+            )
+
+        if move_to_device and not self.is_runtime_model:
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         if packing_config is not None or external_inputs:
@@ -2162,6 +2912,8 @@ class BaseEncoderGLiNER(BaseGLiNER):
         else:
             model_inputs = batch
 
+        if return_vectors:
+            model_inputs = {**model_inputs, "return_embeddings": True}
         model_output = self.model(**model_inputs, threshold=threshold)
         return model_output
 
@@ -2169,11 +2921,13 @@ class BaseEncoderGLiNER(BaseGLiNER):
         self,
         model_output: Any,
         batch: Dict[str, Any],
-        threshold: Union[float, List[float]] = 0.5,
-        flat_ner: Union[bool, List[bool]] = True,
-        multi_label: Union[bool, List[bool]] = False,
+        threshold: float | List[float] = 0.5,
+        flat_ner: bool | List[bool] = True,
+        multi_label: bool | List[bool] = False,
         return_class_probs: bool = False,
-        input_spans: Optional[List[List[Tuple[int, int]]]] = None,
+        input_spans: List[List[Tuple[int, int]]] | None = None,
+        return_vectors: bool = False,
+        return_label_vectors: bool = False,
     ) -> List[List[Any]]:
         """Decode model output into entity predictions.
 
@@ -2185,6 +2939,8 @@ class BaseEncoderGLiNER(BaseGLiNER):
             multi_label: Whether to allow multiple labels per span.
             return_class_probs: Whether to include class probabilities.
             input_spans: Optional word-level input spans to classify.
+            return_vectors: Whether to attach a contextual vector to every returned span.
+            return_label_vectors: Whether to attach the matched scoring-time label vector.
 
         Returns:
             List of entity lists (one per text in batch).
@@ -2205,6 +2961,13 @@ class BaseEncoderGLiNER(BaseGLiNER):
             multi_label=multi_label,
             return_class_probs=return_class_probs,
             input_spans=input_spans,
+        )
+        _attach_entity_vectors(
+            decoded,
+            model_output,
+            self.config,
+            return_vectors=return_vectors,
+            return_label_vectors=return_label_vectors,
         )
         return decoded
 
@@ -2259,22 +3022,25 @@ class BaseEncoderGLiNER(BaseGLiNER):
     @torch.no_grad()
     def inference(
         self,
-        texts: Union[str, List[str]],
-        labels: List[str],
+        texts: str | List[str],
+        labels: EntityLabels,
         flat_ner: bool = True,
         threshold: float = 0.5,
         multi_label: bool = False,
         batch_size: int = 8,
-        packing_config: Optional[InferencePackingConfig] = None,
-        input_spans: Optional[List[List[Dict]]] = None,
+        packing_config: InferencePackingConfig | None = None,
+        input_spans: List[List[Dict]] | None = None,
         return_class_probs: bool = False,
+        *,
+        return_vectors: bool = False,
+        return_label_vectors: bool = False,
         **external_inputs,
     ) -> List[List[Dict[str, Any]]]:
         """Predict entities for a batch of texts.
 
         Args:
             texts: A list of input texts to predict entities for or a single text string.
-            labels: A list of labels to predict.
+            labels: Shared or per-text entity labels, optionally mapped to descriptions.
             flat_ner: Whether to use flat NER. Defaults to True.
             threshold: Confidence threshold for predictions. Defaults to 0.5.
             multi_label: Whether to allow multiple labels per token. Defaults to False.
@@ -2283,6 +3049,8 @@ class BaseEncoderGLiNER(BaseGLiNER):
                 the instance-level configuration set via configure_inference_packing is used.
             input_spans: Input entity spans that should be classified by the model.
             return_class_probs: Whether to include class probabilities in output. Defaults to False.
+            return_vectors: Whether to include a contextual vector for each returned entity.
+            return_label_vectors: Whether to include the matched label vector for each entity.
             **external_inputs: Additional inputs to pass to the model.
 
         Returns:
@@ -2296,6 +3064,11 @@ class BaseEncoderGLiNER(BaseGLiNER):
         """
         self.eval()
 
+        if (return_vectors or return_label_vectors) and self.is_runtime_model:
+            raise NotImplementedError(
+                "Entity and label vectors are not available from the current ONNX/OpenVINO exports"
+            )
+
         prepared = self.prepare_batch(texts, labels, input_spans)
 
         if not prepared["valid_texts"]:
@@ -2303,12 +3076,36 @@ class BaseEncoderGLiNER(BaseGLiNER):
 
         collator = self.create_collator()
 
-        def collate_fn(batch):
-            return self.collate_batch(batch, prepared["entity_types"], collator)
+        def collate_fn(indices):
+            entity_types = _entity_types_for_chunk(prepared["entity_types"], indices)
+            label_names = prepared.get("label_names")
+            label_names = entity_types if label_names is None else _entity_types_for_chunk(label_names, indices)
+            batch = self.collate_batch(
+                [prepared["input_x"][i] for i in indices],
+                entity_types,
+                collator,
+            )
+            _remap_id_to_classes(batch, entity_types, label_names)
+            return batch
+
+        loader_batch_size = batch_size
+        entity_types = prepared["entity_types"]
+        has_per_row_entity_types = bool(entity_types and isinstance(entity_types[0], list))
+        needs_per_row_label_layout = has_per_row_entity_types and (
+            not entity_types[0] or any(row != entity_types[0] for row in entity_types[1:])
+        )
+        if (
+            self.is_runtime_model
+            and isinstance(self.data_processor, (BiEncoderSpanProcessor, BiEncoderTokenProcessor))
+            and needs_per_row_label_layout
+        ):
+            # Existing bi-encoder ONNX graphs expose one shared label matrix and
+            # cannot consume the per-row gather metadata used by the PyTorch model.
+            loader_batch_size = 1
 
         data_loader = torch.utils.data.DataLoader(
-            prepared["input_x"],
-            batch_size=batch_size,
+            list(range(len(prepared["input_x"]))),
+            batch_size=loader_batch_size,
             shuffle=False,
             collate_fn=collate_fn,
         )
@@ -2323,6 +3120,8 @@ class BaseEncoderGLiNER(BaseGLiNER):
             packing_config=active_packing,
             return_class_probs=return_class_probs,
             word_input_spans=prepared["word_input_spans"],
+            return_vectors=return_vectors,
+            return_label_vectors=return_label_vectors,
             **external_inputs,
         )
 
@@ -2340,11 +3139,14 @@ class BaseEncoderGLiNER(BaseGLiNER):
     def predict_entities(
         self,
         text: str,
-        labels: List[str],
+        labels: EntityLabels,
         flat_ner: bool = True,
         threshold: float = 0.5,
         multi_label: bool = False,
         return_class_probs: bool = False,
+        *,
+        return_vectors: bool = False,
+        return_label_vectors: bool = False,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """Predict entities for a single text input.
@@ -2356,6 +3158,8 @@ class BaseEncoderGLiNER(BaseGLiNER):
             threshold: Confidence threshold for predictions. Defaults to 0.5.
             multi_label: Whether to allow multiple labels per entity. Defaults to False.
             return_class_probs: Whether to include class probabilities in output. Defaults to False.
+            return_vectors: Whether to include a contextual vector for each returned entity.
+            return_label_vectors: Whether to include the matched label vector for each entity.
             **kwargs: Additional arguments passed to inference.
 
         Returns:
@@ -2368,16 +3172,21 @@ class BaseEncoderGLiNER(BaseGLiNER):
             threshold=threshold,
             multi_label=multi_label,
             return_class_probs=return_class_probs,
+            return_vectors=return_vectors,
+            return_label_vectors=return_label_vectors,
             **kwargs,
         )[0]
 
     def batch_predict_entities(
         self,
         texts: List[str],
-        labels: List[str],
+        labels: EntityLabels,
         flat_ner: bool = True,
         threshold: float = 0.5,
         multi_label: bool = False,
+        *,
+        return_vectors: bool = False,
+        return_label_vectors: bool = False,
         **kwargs,
     ) -> List[List[Dict[str, Any]]]:
         """Predict entities for multiple texts.
@@ -2393,6 +3202,8 @@ class BaseEncoderGLiNER(BaseGLiNER):
             flat_ner: Use flat NER. Defaults to True.
             threshold: Confidence threshold. Defaults to 0.5.
             multi_label: Allow multiple labels per token/entity. Defaults to False.
+            return_vectors: Whether to include a contextual vector for each returned entity.
+            return_label_vectors: Whether to include the matched label vector for each entity.
             **kwargs: Extra arguments forwarded to inference (e.g., batch_size).
 
         Returns:
@@ -2410,6 +3221,8 @@ class BaseEncoderGLiNER(BaseGLiNER):
             flat_ner=flat_ner,
             threshold=threshold,
             multi_label=multi_label,
+            return_vectors=return_vectors,
+            return_label_vectors=return_label_vectors,
             **kwargs,
         )
 
@@ -2466,7 +3279,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
         multi_label: bool = False,
         threshold: float = 0.5,
         batch_size: int = 12,
-        entity_types: Optional[List[str]] = None,
+        entity_types: List[str] | None = None,
     ) -> Tuple[Any, float]:
         """Evaluate the model on a given test dataset.
 
@@ -2508,15 +3321,15 @@ class BaseEncoderGLiNER(BaseGLiNER):
         self,
         texts: List[str],
         labels: List[str],
-        rel_labels: Optional[List[str]] = None,
+        rel_labels: List[str] | None = None,
         batch_size: int = 8,
         distill: bool = False,
         distill_threshold: float = 0.3,
         distill_epochs: int = 3,
         distill_lr: float = 1e-5,
-        distill_batch_size: Optional[int] = None,
+        distill_batch_size: int | None = None,
         distill_output_dir: str = "./distill_ckpt",
-        distill_train_kwargs: Optional[Dict[str, Any]] = None,
+        distill_train_kwargs: Dict[str, Any] | None = None,
     ) -> None:
         """Precompute averaged prompt embeddings for each label.
 
@@ -2560,7 +3373,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
                     threshold=distill_threshold,
                     batch_size=batch_size,
                 )
-            distill_data = [self._predictions_to_word_level(t, p) for t, p in zip(texts, preds)]
+            distill_data = [self._predictions_to_word_level(t, p) for t, p in zip(texts, preds, strict=False)]
             for sample in distill_data:
                 sample["ner_labels"] = labels
 
@@ -2624,7 +3437,7 @@ class BaseEncoderGLiNER(BaseGLiNER):
         self,
         texts: List[str],
         labels: List[str],
-        rel_labels: Optional[List[str]] = None,
+        rel_labels: List[str] | None = None,
         batch_size: int = 8,
     ) -> None:
         self.eval()
@@ -2714,10 +3527,18 @@ class BaseEncoderGLiNER(BaseGLiNER):
 
 
 class BaseBiEncoderGLiNER(BaseEncoderGLiNER):
-    def _create_data_processor(self, config, cache_dir, tokenizer=None, words_splitter=None, **kwargs):
-        labels_tokenizer = AutoTokenizer.from_pretrained(config.labels_encoder, cache_dir=cache_dir)
+    def _create_data_processor(
+        self, config, cache_dir, tokenizer=None, words_splitter=None, local_files_only=False, **kwargs
+    ):
+        labels_tokenizer = kwargs.get("labels_tokenizer")
+        if labels_tokenizer is None:
+            labels_tokenizer = AutoTokenizer.from_pretrained(
+                config.labels_encoder, cache_dir=cache_dir, local_files_only=local_files_only
+            )
         if tokenizer is None:
-            tokenizer = AutoTokenizer.from_pretrained(config.model_name, cache_dir=cache_dir)
+            tokenizer = AutoTokenizer.from_pretrained(
+                config.model_name, cache_dir=cache_dir, local_files_only=local_files_only
+            )
             self._set_tokenizer_spec_tokens(tokenizer)
 
         self.data_processor = self.data_processor_class(
@@ -2770,9 +3591,12 @@ class BaseBiEncoderGLiNER(BaseEncoderGLiNER):
         threshold: float = 0.5,
         multi_label: bool = False,
         batch_size: int = 8,
-        packing_config: Optional[InferencePackingConfig] = None,
-        input_spans: Optional[List[List[Dict]]] = None,
+        packing_config: InferencePackingConfig | None = None,
+        input_spans: List[List[Dict]] | None = None,
         return_class_probs: bool = False,
+        *,
+        return_vectors: bool = False,
+        return_label_vectors: bool = False,
     ) -> List[List[Dict[str, Any]]]:
         """Predict entities for a batch of texts using pre-computed label embeddings.
 
@@ -2789,10 +3613,15 @@ class BaseBiEncoderGLiNER(BaseEncoderGLiNER):
             input_spans: Input entity spans to limit predictions to. Each span is a dict
                 with 'start' and 'end' character positions.
             return_class_probs: Whether to include class probabilities in output. Defaults to False.
+            return_vectors: Whether to include a contextual vector for each returned entity.
+            return_label_vectors: Whether to include the matched label vector for each entity.
 
         Returns:
             List of lists with predicted entities.
         """
+        embedding_input = (
+            {"labels_embeddings": labels_embeddings} if self.is_runtime_model else {"labels_embeds": labels_embeddings}
+        )
         all_entities = self.inference(
             texts,
             labels,
@@ -2803,7 +3632,9 @@ class BaseBiEncoderGLiNER(BaseEncoderGLiNER):
             packing_config=packing_config,
             input_spans=input_spans,
             return_class_probs=return_class_probs,
-            labels_embeddings=labels_embeddings,
+            return_vectors=return_vectors,
+            return_label_vectors=return_label_vectors,
+            **embedding_input,
         )
 
         return all_entities
@@ -2817,6 +3648,9 @@ class BaseBiEncoderGLiNER(BaseEncoderGLiNER):
         threshold=0.5,
         multi_label=False,
         return_class_probs=False,
+        *,
+        return_vectors=False,
+        return_label_vectors=False,
         **kwargs,
     ):
         """Predict entities for a single text input using pre-computed label embeddings.
@@ -2829,6 +3663,8 @@ class BaseBiEncoderGLiNER(BaseEncoderGLiNER):
             threshold: Confidence threshold for predictions. Defaults to 0.5.
             multi_label: Whether to allow multiple labels per entity. Defaults to False.
             return_class_probs: Whether to include class probabilities in output. Defaults to False.
+            return_vectors: Whether to include a contextual vector for each returned entity.
+            return_label_vectors: Whether to include the matched label vector for each entity.
             **kwargs: Additional arguments passed to batch_predict_with_embeds.
 
         Returns:
@@ -2842,6 +3678,8 @@ class BaseBiEncoderGLiNER(BaseEncoderGLiNER):
             threshold=threshold,
             multi_label=multi_label,
             return_class_probs=return_class_probs,
+            return_vectors=return_vectors,
+            return_label_vectors=return_label_vectors,
             **kwargs,
         )[0]
 
@@ -2925,7 +3763,7 @@ class BaseBiEncoderGLiNER(BaseEncoderGLiNER):
 
             def forward(self, *args):
                 # Build kwargs from positional args
-                kwargs = dict(zip(self.param_names, args))
+                kwargs = dict(zip(self.param_names, args, strict=False))
                 out = self.core(**kwargs)
                 return out.logits if hasattr(out, "logits") else out[0]
 
@@ -2935,7 +3773,7 @@ class BaseBiEncoderGLiNER(BaseEncoderGLiNER):
         self,
         batch: Dict[str, torch.Tensor],
         from_labels_embeddings: bool = False,
-        labels: Optional[list[str]] = None,
+        labels: list[str] | None = None,
         **export_kwargs,
     ) -> tuple[tuple, Dict[str, Any]]:
         """
@@ -2985,7 +3823,6 @@ class BaseBiEncoderGLiNER(BaseEncoderGLiNER):
 class UniEncoderSpanGLiNER(BaseEncoderGLiNER):
     config_class = UniEncoderSpanConfig
     model_class = UniEncoderSpanModel
-    ort_model_class: type = UniEncoderSpanORTModel
     data_processor_class = UniEncoderSpanProcessor
     data_collator_class = UniEncoderSpanDataCollator
     decoder_class = SpanDecoder
@@ -3048,10 +3885,1290 @@ class UniEncoderSpanGLiNER(BaseEncoderGLiNER):
         return UniEncoderSpanWrapper(core_model)
 
 
+class StreamingSpanGLiNER(BaseEncoderGLiNER):
+    """Causal-decoder span model with optional per-session streaming state."""
+
+    config_class = StreamingSpanConfig
+    model_class = StreamingSpanModel
+    data_processor_class = StreamingSpanProcessor
+    data_collator_class = StreamingSpanDataCollator
+    decoder_class = SpanDecoder
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._session_cache = SessionCacheManager()
+        self._stream_execution_lock = RLock()
+
+    @classmethod
+    def _get_tokenizer_source(cls, config):
+        return config.model_name
+
+    def _get_special_tokens(self):
+        return [self.config.label_token, self.config.sep_token]
+
+    def _create_data_processor(
+        self, config, cache_dir, tokenizer=None, words_splitter=None, local_files_only=False, **kwargs
+    ):
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(
+                config.model_name, cache_dir=cache_dir, local_files_only=local_files_only
+            )
+        if tokenizer.pad_token is None:
+            if tokenizer.eos_token is None:
+                tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+            else:
+                tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+        if words_splitter is None:
+            words_splitter = WordsSplitter(config.words_splitter_type)
+        self.data_processor = self.data_processor_class(config, tokenizer, words_splitter)
+        return self.data_processor
+
+    @staticmethod
+    def _resize_token_embeddings(instance, _config_instance, tokenizer, resize_token_embeddings=True):
+        """Match the real decoder embedding rows before checkpoint weights load.
+
+        StreamingSpan checkpoints can have valid saved special-token indices while
+        an older or absent nested decoder config still advertises the backbone's
+        pre-extension vocabulary.  The generic sentinel check cannot detect that
+        shape mismatch, so this architecture always compares the actual module to
+        its tokenizer when resizing is enabled.
+        """
+        if not resize_token_embeddings:
+            return
+        if tokenizer is not None:
+            tokenizer.add_tokens(instance._get_special_tokens(), special_tokens=True)
+        instance.resize_embeddings()
+
+    def set_class_indices(self):
+        tokenizer = self.data_processor.transformer_tokenizer
+        label_token_id = tokenizer.convert_tokens_to_ids(self.config.label_token)
+        sep_token_id = tokenizer.convert_tokens_to_ids(self.config.sep_token)
+        if label_token_id is None or label_token_id == tokenizer.unk_token_id:
+            raise ValueError(f"Label token {self.config.label_token!r} is not registered in the tokenizer")
+        if sep_token_id is None or sep_token_id == tokenizer.unk_token_id:
+            raise ValueError(f"Separator token {self.config.sep_token!r} is not registered in the tokenizer")
+        self.config.class_token_index = label_token_id
+        self.config.sep_token_index = sep_token_id
+
+    def resize_embeddings(self, set_class_token_index=True):
+        if set_class_token_index:
+            self.set_class_indices()
+        tokenizer_size = len(self.data_processor.transformer_tokenizer)
+        decoder_model = self.model.token_rep_layer.decoder_layer.model
+        if decoder_model.get_input_embeddings().num_embeddings != tokenizer_size:
+            embedding_weight = decoder_model.get_input_embeddings().weight
+            if embedding_weight.is_meta:
+                # Mean/covariance initialization calls Tensor.item(), which is
+                # unavailable on shape-only meta tensors. Checkpoint loading
+                # replaces every resized row immediately afterward.
+                decoder_model.resize_token_embeddings(tokenizer_size, mean_resizing=False)
+            else:
+                decoder_model.resize_token_embeddings(tokenizer_size)
+        embedding_size = decoder_model.get_input_embeddings().num_embeddings
+        self.config.vocab_size = embedding_size
+        self.config.decoder_config = decoder_model.config
+        self.config.decoder_config.vocab_size = embedding_size
+
+    def _get_freezable_components(self):
+        components = super()._get_freezable_components()
+        components["decoder_backbone"] = self.model.token_rep_layer.decoder_layer.model
+        components["labels_encoder"] = self.model.labels_encoder
+        return components
+
+    def clear_session(self, session_id: str | List[str]) -> None:
+        """Remove one or more cached inference sessions."""
+        self._session_cache.clear(session_id)
+
+    def clear_sessions(self) -> None:
+        """Remove every cached inference session."""
+        self._session_cache.clear()
+
+    def create_streaming_batch(self, session_ids: List[str], labels: List[str]):
+        """Create a persistent fixed-order streaming batch."""
+        return StreamingBatch(self, session_ids, labels)
+
+    def create_async_streaming_engine(
+        self,
+        *,
+        max_batch_size: int = 32,
+        batch_wait_timeout_ms: float = 2.0,
+        queue_capacity: int = 4096,
+    ):
+        """Create an asynchronous dynamic-microbatch streaming engine."""
+        return AsyncStreamingEngine(
+            self,
+            max_batch_size=max_batch_size,
+            batch_wait_timeout_ms=batch_wait_timeout_ms,
+            queue_capacity=queue_capacity,
+        )
+
+    @property
+    def session_count(self) -> int:
+        """Return the number of currently cached sessions."""
+        return len(self._session_cache)
+
+    def _collate_session_tokens(self, tokens, labels, include_prompt):
+        return self._collate_session_batch(
+            [list(tokens)],
+            [list(labels)],
+            include_prompt=include_prompt,
+        )
+
+    def _collate_session_batch(
+        self,
+        tokens_batch,
+        labels_batch,
+        *,
+        include_prompt,
+        span_candidates=None,
+    ):
+        """Collate one streaming step for multiple independent session rows."""
+        if len(tokens_batch) != len(labels_batch):
+            raise ValueError("tokens_batch and labels_batch must have the same length")
+        if not tokens_batch:
+            raise ValueError("At least one streaming row is required")
+
+        include_flags = (
+            [include_prompt] * len(tokens_batch) if isinstance(include_prompt, bool) else list(include_prompt)
+        )
+        if len(include_flags) != len(tokens_batch):
+            raise ValueError("include_prompt must have one value per streaming row")
+
+        class_to_ids = []
+        id_to_classes = []
+        for labels in labels_batch:
+            class_to_id = {label: index + 1 for index, label in enumerate(labels)}
+            class_to_ids.append(class_to_id)
+            id_to_classes.append({index: label for label, index in class_to_id.items()})
+
+        if span_candidates is None:
+            span_candidates = [
+                prepare_streaming_span_idx(
+                    0,
+                    len(tokens),
+                    self.config.max_width,
+                    recompute_all=True,
+                )
+                for tokens in tokens_batch
+            ]
+        if len(span_candidates) != len(tokens_batch):
+            raise ValueError("span_candidates must have one value per streaming row")
+
+        span_idx = pad_sequence(
+            [candidate[0] for candidate in span_candidates],
+            batch_first=True,
+            padding_value=0,
+        )
+        span_mask = pad_sequence(
+            [candidate[1].bool() for candidate in span_candidates],
+            batch_first=True,
+            padding_value=False,
+        )
+        raw_batch = {
+            "tokens": [list(tokens) for tokens in tokens_batch],
+            "classes_to_id": class_to_ids,
+            "id_to_classes": id_to_classes,
+            "span_idx": span_idx,
+            "span_mask": span_mask,
+            "seq_length": torch.tensor(
+                [[len(tokens)] for tokens in tokens_batch],
+                dtype=torch.long,
+            ),
+        }
+        model_input = self.data_processor.collate_fn(
+            raw_batch,
+            prepare_labels=False,
+            include_prompt=include_flags,
+            truncation=False,
+        )
+        model_input.update(
+            {
+                "span_idx": raw_batch["span_idx"],
+                "span_mask": raw_batch["span_mask"],
+                "text_lengths": raw_batch["seq_length"],
+                "tokens": raw_batch["tokens"],
+                "id_to_classes": raw_batch["id_to_classes"],
+            }
+        )
+        return model_input
+
+    def _decoder_context_limit(self) -> int | None:
+        configured = getattr(self.config, "max_cache_length", None)
+        decoder_config = self.model.token_rep_layer.decoder_layer.model.config
+        backbone_limit = getattr(decoder_config, "max_position_embeddings", None)
+        if backbone_limit is None:
+            backbone_limit = getattr(decoder_config, "n_positions", None)
+        if configured is None:
+            return backbone_limit
+        return min(configured, backbone_limit) if backbone_limit is not None else configured
+
+    def _create_session_cache(self):
+        decoder_config = self.model.token_rep_layer.decoder_layer.model.config
+        return create_reusable_cache(
+            decoder_config,
+            max_cache_length=self._decoder_context_limit(),
+        )
+
+    def _validate_context_length(self, length: int, session_id: str) -> None:
+        limit = self._decoder_context_limit()
+        if limit is not None and length > limit:
+            raise ValueError(
+                f"Session {session_id!r} would contain {length} decoder tokens, exceeding "
+                f"the configured context limit of {limit}. Clear the session before continuing."
+            )
+
+    @staticmethod
+    def _compact_row(values: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        valid = mask.bool()
+        compact = values[valid]
+        return compact, torch.ones(compact.size(0), dtype=torch.bool, device=compact.device)
+
+    @staticmethod
+    def _reserve_word_cache(
+        values: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        valid = mask.bool()
+        compact = values[valid]
+        capacity = max(DEFAULT_CACHE_INITIAL_CAPACITY, compact.size(0))
+        storage = compact.new_empty(capacity, compact.size(-1))
+        storage_mask = torch.zeros(capacity, dtype=torch.bool, device=compact.device)
+        storage[: compact.size(0)].copy_(compact)
+        storage_mask[: compact.size(0)] = True
+        return storage, storage_mask
+
+    @staticmethod
+    def _merge_session_span_logits(
+        previous: Dict[Tuple[int, int], torch.Tensor],
+        model_output: Any,
+        *,
+        replace_all: bool = False,
+        batch_index: int = 0,
+        class_count: int | None = None,
+    ) -> Dict[Tuple[int, int], torch.Tensor]:
+        """Update the CPU span-score history with candidates from one session call."""
+        logits = model_output.logits
+        if not isinstance(logits, torch.Tensor):
+            logits = torch.as_tensor(logits)
+        if logits.dim() == 4:
+            logits = logits.flatten(1, 2)
+        if logits.dim() != 3:
+            raise ValueError("Session span logits must have shape (batch, num_spans, num_classes)")
+        if not 0 <= batch_index < logits.size(0):
+            raise IndexError("batch_index is outside the model output batch")
+
+        span_idx = model_output.span_idx.view(logits.size(0), -1, 2)
+        span_mask = model_output.span_mask.view(logits.size(0), -1).bool()
+        if span_idx.size(1) != logits.size(1) or span_mask.size(1) != logits.size(1):
+            raise ValueError("Session span indices, mask, and logits must describe the same candidates")
+
+        row_mask = span_mask[batch_index]
+        valid_idx = span_idx[batch_index, row_mask].detach().cpu()
+        valid_logits = logits[batch_index, row_mask]
+        if class_count is not None:
+            valid_logits = valid_logits[..., :class_count]
+        valid_logits = valid_logits.detach().cpu()
+        merged = {} if replace_all else previous.copy()
+        for boundary, scores in zip(valid_idx.tolist(), valid_logits, strict=False):
+            merged[(int(boundary[0]), int(boundary[1]))] = scores.clone()
+        return merged
+
+    def _state_from_output(
+        self,
+        session_id,
+        labels,
+        batch,
+        model_output,
+        text,
+        tokens,
+        char_starts,
+        char_ends,
+        *,
+        batch_index=0,
+        past_key_values=None,
+        label_names=None,
+    ):
+        current_attention = (
+            batch["label_attention_mask"] if "label_attention_mask" in batch else batch["attention_mask"]
+        )
+        valid_tokens = current_attention[batch_index].bool()
+        input_ids = batch["input_ids"][batch_index][valid_tokens]
+        token_word_mask = batch["words_mask"][batch_index][valid_tokens]
+
+        raw_words, raw_word_mask = self._reserve_word_cache(
+            model_output.past_word_embeddings[batch_index],
+            model_output.past_word_mask[batch_index],
+        )
+        raw_prompts, prompt_mask = self._compact_row(
+            model_output.cached_prompts_embedding[batch_index],
+            model_output.cached_prompts_mask[batch_index],
+        )
+        cached_length = input_ids.size(0)
+        return CacheState(
+            past_key_values=(model_output.past_key_values if past_key_values is None else past_key_values),
+            input_ids=input_ids.detach(),
+            attention_mask=torch.ones_like(input_ids),
+            token_word_mask=token_word_mask.detach(),
+            past_word_embeddings=raw_words.detach(),
+            past_word_mask=raw_word_mask.detach(),
+            prompts_embedding=raw_prompts.detach(),
+            prompts_mask=prompt_mask.detach(),
+            cached_length=cached_length,
+            next_position_id=cached_length,
+            session_id=session_id,
+            labels=tuple(labels),
+            label_names=tuple(label_names) if label_names is not None else None,
+            text=text,
+            tokens=list(tokens),
+            char_starts=list(char_starts),
+            char_ends=list(char_ends),
+            span_logits=self._merge_session_span_logits(
+                {},
+                model_output,
+                replace_all=True,
+                batch_index=batch_index,
+                class_count=len(labels),
+            ),
+        )
+
+    def _decode_session_output(
+        self,
+        state,
+        threshold,
+        flat_ner,
+        multi_label,
+        return_class_probs,
+    ):
+        if not state.span_logits:
+            return []
+
+        label_names = state.label_names if state.label_names is not None else state.labels
+        id_to_classes = {index + 1: label for index, label in enumerate(label_names)}
+        ordered_scores = sorted(state.span_logits.items())
+        span_idx = torch.tensor(
+            [[boundary for boundary, _ in ordered_scores]],
+            dtype=torch.long,
+        )
+        span_logits = torch.stack([scores for _, scores in ordered_scores]).float().unsqueeze(0)
+        span_mask = torch.ones(span_idx.shape[:2], dtype=torch.bool)
+        decoded = self.decoder.decode(
+            [state.tokens],
+            id_to_classes,
+            span_logits,
+            span_idx=span_idx,
+            span_mask=span_mask,
+            flat_ner=flat_ner,
+            threshold=threshold,
+            multi_label=multi_label,
+            return_class_probs=return_class_probs,
+        )[0]
+
+        entities = []
+        for span in decoded:
+            if span.start < 0 or span.end >= len(state.char_ends):
+                continue
+            start = state.char_starts[span.start]
+            end = state.char_ends[span.end]
+            entity = {
+                "start": start,
+                "end": end,
+                "text": state.text[start:end],
+                "label": span.entity_type,
+                "score": span.score,
+            }
+            if span.class_probs is not None:
+                entity["class_probs"] = span.class_probs
+            entities.append(entity)
+        return entities
+
+    def _prepare_session_item(self, text, labels, session_id, recompute, label_names=None):
+        """Prepare semantic and token metadata for one streaming append."""
+        label_names = tuple(labels if label_names is None else label_names)
+        state = self._session_cache.get(session_id)
+        if state is not None and not recompute:
+            previous_names = state.label_names if state.label_names is not None else state.labels
+            if state.labels != tuple(labels) or previous_names != label_names:
+                raise ValueError(
+                    f"Labels for session {session_id!r} changed. Pass recompute=True or clear the session."
+                )
+
+        current_tokens, current_starts, current_ends = self.prepare_inputs([text])
+        current_tokens = current_tokens[0]
+        current_starts = current_starts[0]
+        current_ends = current_ends[0]
+        char_offset = len(state.text) if state is not None else 0
+        return {
+            "session_id": session_id,
+            "labels": tuple(labels),
+            "label_names": label_names,
+            "state": state,
+            "current_tokens": current_tokens,
+            "current_starts": current_starts,
+            "current_ends": current_ends,
+            "combined_text": (state.text if state is not None else "") + text,
+            "combined_tokens": (state.tokens if state is not None else []) + current_tokens,
+            "combined_starts": (state.char_starts if state is not None else [])
+            + [char_offset + value for value in current_starts],
+            "combined_ends": (state.char_ends if state is not None else [])
+            + [char_offset + value for value in current_ends],
+            "full_recompute": state is None or recompute,
+        }
+
+    def _run_full_session_batch(self, items):
+        """Run cold or explicitly recomputed sessions in one model forward."""
+        tokens_batch = [item["combined_tokens"] for item in items]
+        labels_batch = [list(item["labels"]) for item in items]
+        batch = self._collate_session_batch(
+            tokens_batch,
+            labels_batch,
+            include_prompt=True,
+        )
+        batch = {
+            key: value.to(self.device) if isinstance(value, torch.Tensor) else value for key, value in batch.items()
+        }
+        token_counts = batch["attention_mask"].sum(dim=1).tolist()
+        for item, token_count in zip(items, token_counts, strict=False):
+            self._validate_context_length(int(token_count), item["session_id"])
+
+        model_output = self.model(
+            **batch,
+            past_key_values=self._create_session_cache(),
+        )
+        row_caches = split_past_key_values(
+            model_output.past_key_values,
+            [int(length) for length in token_counts],
+            config=self.model.token_rep_layer.decoder_layer.model.config,
+            max_cache_length=self._decoder_context_limit(),
+        )
+        batch["label_attention_mask"] = batch["attention_mask"]
+
+        states = []
+        for row, (item, row_cache) in enumerate(zip(items, row_caches, strict=False)):
+            states.append(
+                self._state_from_output(
+                    item["session_id"],
+                    item["labels"],
+                    batch,
+                    model_output,
+                    item["combined_text"],
+                    item["combined_tokens"],
+                    item["combined_starts"],
+                    item["combined_ends"],
+                    batch_index=row,
+                    past_key_values=row_cache,
+                    label_names=item["label_names"],
+                )
+            )
+        for state in states:
+            self._session_cache.put(state)
+        return states
+
+    @staticmethod
+    def _stack_session_word_cache(states, capacity):
+        reference = states[0].past_word_embeddings
+        embeddings = reference.new_empty(
+            len(states),
+            capacity,
+            reference.size(-1),
+        )
+        mask = torch.zeros(
+            len(states),
+            capacity,
+            dtype=torch.bool,
+            device=reference.device,
+        )
+        for row, state in enumerate(states):
+            valid = state.past_word_mask.bool()
+            compact = state.past_word_embeddings[valid]
+            embeddings[row, : compact.size(0)].copy_(compact)
+            mask[row, : compact.size(0)] = True
+        return embeddings, mask
+
+    @staticmethod
+    def _stack_session_prompts(states):
+        max_prompts = max(state.prompts_embedding.size(0) for state in states)
+        reference = states[0].prompts_embedding
+        embeddings = reference.new_zeros(
+            len(states),
+            max_prompts,
+            reference.size(-1),
+        )
+        mask = torch.zeros(
+            len(states),
+            max_prompts,
+            dtype=torch.bool,
+            device=reference.device,
+        )
+        for row, state in enumerate(states):
+            valid = state.prompts_mask.bool()
+            compact = state.prompts_embedding[valid]
+            embeddings[row, : compact.size(0)].copy_(compact)
+            mask[row, : compact.size(0)] = True
+        return embeddings, mask
+
+    @staticmethod
+    def _reserve_batched_word_cache(values, mask):
+        capacity = max(DEFAULT_CACHE_INITIAL_CAPACITY, values.size(1))
+        if capacity == values.size(1):
+            return values.detach(), mask.bool().detach()
+        storage = values.new_empty(values.size(0), capacity, values.size(2))
+        storage_mask = torch.zeros(
+            values.size(0),
+            capacity,
+            dtype=torch.bool,
+            device=values.device,
+        )
+        storage[:, : values.size(1)].copy_(values)
+        storage_mask[:, : mask.size(1)] = mask.bool()
+        return storage.detach(), storage_mask.detach()
+
+    def _prepare_persistent_batch_items(
+        self,
+        state,
+        session_ids,
+        labels,
+        texts,
+    ):
+        items = []
+        for row, (session_id, text) in enumerate(zip(session_ids, texts, strict=False)):
+            previous = None if state is None else state.sessions[row]
+            current_tokens, current_starts, current_ends = self.prepare_inputs([text])
+            current_tokens = current_tokens[0]
+            current_starts = current_starts[0]
+            current_ends = current_ends[0]
+            char_offset = len(previous.text) if previous is not None else 0
+            items.append(
+                {
+                    "session_id": session_id,
+                    "labels": tuple(labels),
+                    "previous": previous,
+                    "current_tokens": current_tokens,
+                    "combined_text": (previous.text if previous is not None else "") + text,
+                    "combined_tokens": (previous.tokens if previous is not None else []) + current_tokens,
+                    "combined_starts": (previous.char_starts if previous is not None else [])
+                    + [char_offset + value for value in current_starts],
+                    "combined_ends": (previous.char_ends if previous is not None else [])
+                    + [char_offset + value for value in current_ends],
+                }
+            )
+        return items
+
+    def _decode_persistent_batch_state(
+        self,
+        state,
+        threshold,
+        flat_ner,
+        multi_label,
+        return_class_probs,
+    ):
+        return [
+            self._decode_session_output(
+                session,
+                threshold,
+                flat_ner,
+                multi_label,
+                return_class_probs,
+            )
+            for session in state.sessions
+        ]
+
+    @torch.inference_mode()
+    def _run_persistent_stream_batch(
+        self,
+        state,
+        session_ids,
+        labels,
+        texts,
+        *,
+        threshold,
+        flat_ner,
+        multi_label,
+        return_class_probs,
+        recompute,
+    ):
+        """Advance a fixed-order batch while retaining one batched KV cache."""
+        with self._stream_execution_lock:
+            if state is not None and state.batch_size != len(session_ids):
+                raise ValueError("Persistent streaming batch size cannot change")
+            if state is not None and tuple(session.session_id for session in state.sessions) != tuple(session_ids):
+                raise ValueError("Persistent streaming session order cannot change")
+
+            if state is not None and not recompute and not any(text.strip() for text in texts):
+                return state, self._decode_persistent_batch_state(
+                    state,
+                    threshold,
+                    flat_ner,
+                    multi_label,
+                    return_class_probs,
+                )
+            if state is None and not any(text.strip() for text in texts):
+                return None, [[] for _ in texts]
+
+            items = self._prepare_persistent_batch_items(
+                state,
+                session_ids,
+                labels,
+                texts,
+            )
+            full_recompute = state is None or recompute
+
+            if full_recompute:
+                batch = self._collate_session_batch(
+                    [item["combined_tokens"] for item in items],
+                    [list(item["labels"]) for item in items],
+                    include_prompt=True,
+                )
+                batch = {
+                    key: value.to(self.device) if isinstance(value, torch.Tensor) else value
+                    for key, value in batch.items()
+                }
+                token_counts = batch["attention_mask"].sum(dim=1).long()
+                for item, token_count in zip(items, token_counts.tolist(), strict=False):
+                    self._validate_context_length(int(token_count), item["session_id"])
+                model_output = self.model(
+                    **batch,
+                    past_key_values=self._create_session_cache(),
+                )
+                past_words, past_word_mask = self._reserve_batched_word_cache(
+                    model_output.past_word_embeddings,
+                    model_output.past_word_mask,
+                )
+                sessions = []
+                for row, (item, token_count) in enumerate(zip(items, token_counts.tolist(), strict=False)):
+                    sessions.append(
+                        CacheState(
+                            cached_length=int(token_count),
+                            next_position_id=int(token_count),
+                            session_id=item["session_id"],
+                            labels=item["labels"],
+                            text=item["combined_text"],
+                            tokens=item["combined_tokens"],
+                            char_starts=item["combined_starts"],
+                            char_ends=item["combined_ends"],
+                            span_logits=self._merge_session_span_logits(
+                                {},
+                                model_output,
+                                replace_all=True,
+                                batch_index=row,
+                                class_count=len(item["labels"]),
+                            ),
+                        )
+                    )
+                new_state = _PersistentBatchState(
+                    past_key_values=model_output.past_key_values,
+                    attention_mask=batch["attention_mask"].detach(),
+                    past_word_embeddings=past_words,
+                    past_word_mask=past_word_mask,
+                    prompts_embedding=model_output.cached_prompts_embedding.detach(),
+                    prompts_mask=model_output.cached_prompts_mask.bool().detach(),
+                    cached_lengths=token_counts.to(self.device),
+                    next_position_ids=token_counts.to(self.device),
+                    sessions=sessions,
+                )
+                return new_state, self._decode_persistent_batch_state(
+                    new_state,
+                    threshold,
+                    flat_ner,
+                    multi_label,
+                    return_class_probs,
+                )
+
+            span_candidates = []
+            for item in items:
+                previous = item["previous"]
+                if not item["current_tokens"]:
+                    span_candidates.append(
+                        (
+                            torch.zeros((0, 2), dtype=torch.long),
+                            torch.zeros(0, dtype=torch.bool),
+                        )
+                    )
+                    continue
+                right_context_width = getattr(self.config, "right_context_width", None)
+                if right_context_width is None:
+                    right_context_width = self.config.max_width
+                span_candidates.append(
+                    prepare_streaming_span_idx(
+                        previous.word_length,
+                        len(item["current_tokens"]),
+                        self.config.max_width,
+                        recompute_all=self.model.span_rep_layer.uses_bidirectional_context,
+                        right_context_width=right_context_width,
+                    )
+                )
+
+            batch = self._collate_session_batch(
+                [item["current_tokens"] for item in items],
+                [list(item["labels"]) for item in items],
+                include_prompt=False,
+                span_candidates=span_candidates,
+            )
+            batch = {
+                key: value.to(self.device) if isinstance(value, torch.Tensor) else value for key, value in batch.items()
+            }
+            current_attention = batch["attention_mask"]
+            current_counts = current_attention.sum(dim=1).long()
+            for item, previous, current_count in zip(items, state.sessions, current_counts.tolist(), strict=False):
+                self._validate_context_length(
+                    previous.cached_length + int(current_count),
+                    item["session_id"],
+                )
+
+            physical_length = state.physical_length + batch["input_ids"].size(1)
+            context_limit = self._decoder_context_limit()
+            if context_limit is not None and physical_length > context_limit:
+                raise ValueError(
+                    f"Persistent streaming batch would contain {physical_length} physical cache positions, "
+                    f"exceeding the configured context limit of {context_limit}. Reset the batch before continuing."
+                )
+
+            full_attention = torch.cat([state.attention_mask, current_attention], dim=1)
+            position_ids = state.next_position_ids.unsqueeze(1) + torch.arange(
+                batch["input_ids"].size(1),
+                device=self.device,
+            ).unsqueeze(0)
+            past_word_lengths = torch.tensor(
+                [session.word_length for session in state.sessions],
+                dtype=torch.long,
+                device=self.device,
+            )
+            model_output = self.model(
+                input_ids=batch["input_ids"],
+                attention_mask=full_attention,
+                label_attention_mask=current_attention,
+                past_word_length=past_word_lengths,
+                past_key_values=state.past_key_values,
+                past_word_embeddings=state.past_word_embeddings,
+                past_word_mask=state.past_word_mask,
+                prompts_embedding=state.prompts_embedding,
+                prompts_embedding_mask=state.prompts_mask,
+                words_mask=batch["words_mask"],
+                text_lengths=batch["text_lengths"],
+                span_idx=batch["span_idx"],
+                span_mask=batch["span_mask"],
+                position_ids=position_ids,
+            )
+
+            sessions = []
+            for row, (item, previous, current_count) in enumerate(
+                zip(items, state.sessions, current_counts.tolist(), strict=False)
+            ):
+                sessions.append(
+                    CacheState(
+                        cached_length=previous.cached_length + int(current_count),
+                        next_position_id=previous.next_position + int(current_count),
+                        session_id=item["session_id"],
+                        labels=item["labels"],
+                        text=item["combined_text"],
+                        tokens=item["combined_tokens"],
+                        char_starts=item["combined_starts"],
+                        char_ends=item["combined_ends"],
+                        span_logits=self._merge_session_span_logits(
+                            previous.span_logits,
+                            model_output,
+                            batch_index=row,
+                            class_count=len(item["labels"]),
+                        ),
+                    )
+                )
+
+            new_state = _PersistentBatchState(
+                past_key_values=model_output.past_key_values,
+                attention_mask=full_attention.detach(),
+                past_word_embeddings=model_output.past_word_embeddings.detach(),
+                past_word_mask=model_output.past_word_mask.bool().detach(),
+                prompts_embedding=model_output.cached_prompts_embedding.detach(),
+                prompts_mask=model_output.cached_prompts_mask.bool().detach(),
+                cached_lengths=state.cached_lengths + current_counts,
+                next_position_ids=state.next_position_ids + current_counts,
+                sessions=sessions,
+            )
+            return new_state, self._decode_persistent_batch_state(
+                new_state,
+                threshold,
+                flat_ner,
+                multi_label,
+                return_class_probs,
+            )
+
+    def _run_incremental_session_batch(self, items):
+        """Run equal-cache-length warm sessions in one model forward."""
+        cached_states = [item["state"].to(self.device) for item in items]
+        cached_lengths = {state.cached_length for state in cached_states}
+        if len(cached_lengths) != 1:
+            raise ValueError("Incremental session batches require equal cached token lengths")
+        cached_length = cached_states[0].cached_length
+
+        span_candidates = []
+        for item, state in zip(items, cached_states, strict=False):
+            right_context_width = getattr(self.config, "right_context_width", None)
+            if right_context_width is None:
+                right_context_width = self.config.max_width
+            span_candidates.append(
+                prepare_streaming_span_idx(
+                    state.word_length,
+                    len(item["current_tokens"]),
+                    self.config.max_width,
+                    recompute_all=self.model.span_rep_layer.uses_bidirectional_context,
+                    right_context_width=right_context_width,
+                )
+            )
+
+        batch = self._collate_session_batch(
+            [item["current_tokens"] for item in items],
+            [list(item["labels"]) for item in items],
+            include_prompt=False,
+            span_candidates=span_candidates,
+        )
+        batch = {
+            key: value.to(self.device) if isinstance(value, torch.Tensor) else value for key, value in batch.items()
+        }
+        current_attention = batch["attention_mask"]
+        current_token_counts = [int(value) for value in current_attention.sum(dim=1).tolist()]
+        for item, state, token_count in zip(items, cached_states, current_token_counts, strict=False):
+            self._validate_context_length(
+                state.cached_length + token_count,
+                item["session_id"],
+            )
+
+        current_width = batch["input_ids"].size(1)
+        full_attention = torch.cat(
+            [torch.stack([state.attention_mask for state in cached_states]), current_attention],
+            dim=1,
+        )
+        position_starts = torch.tensor(
+            [state.next_position for state in cached_states],
+            dtype=torch.long,
+            device=self.device,
+        )
+        position_ids = position_starts.unsqueeze(1) + torch.arange(
+            current_width,
+            device=self.device,
+        ).unsqueeze(0)
+
+        past_word_lengths = torch.tensor(
+            [state.word_length for state in cached_states],
+            dtype=torch.long,
+            device=self.device,
+        )
+        required_word_capacity = max(
+            DEFAULT_CACHE_INITIAL_CAPACITY,
+            *(
+                state.word_length + len(item["current_tokens"])
+                for item, state in zip(items, cached_states, strict=False)
+            ),
+        )
+        past_word_embeddings, past_word_mask = self._stack_session_word_cache(
+            cached_states,
+            required_word_capacity,
+        )
+        prompts_embedding, prompts_mask = self._stack_session_prompts(cached_states)
+        batched_cache = stack_past_key_values(
+            [state.past_key_values for state in cached_states],
+            config=self.model.token_rep_layer.decoder_layer.model.config,
+            max_cache_length=self._decoder_context_limit(),
+        )
+
+        model_output = self.model(
+            input_ids=batch["input_ids"],
+            attention_mask=full_attention,
+            label_attention_mask=current_attention,
+            past_word_length=past_word_lengths,
+            past_key_values=batched_cache,
+            past_word_embeddings=past_word_embeddings,
+            past_word_mask=past_word_mask,
+            prompts_embedding=prompts_embedding,
+            prompts_embedding_mask=prompts_mask,
+            words_mask=batch["words_mask"],
+            text_lengths=batch["text_lengths"],
+            span_idx=batch["span_idx"],
+            span_mask=batch["span_mask"],
+            position_ids=position_ids,
+        )
+        total_token_lengths = [cached_length + count for count in current_token_counts]
+        row_caches = split_past_key_values(
+            model_output.past_key_values,
+            total_token_lengths,
+            config=self.model.token_rep_layer.decoder_layer.model.config,
+            max_cache_length=self._decoder_context_limit(),
+        )
+
+        states = []
+        for row, (item, cached, row_cache, current_token_count) in enumerate(
+            zip(items, cached_states, row_caches, current_token_counts, strict=False)
+        ):
+            valid_current = current_attention[row].bool()
+            current_ids = batch["input_ids"][row][valid_current]
+            current_word_mask = batch["words_mask"][row][valid_current].clone()
+            current_word_mask[current_word_mask > 0] += cached.word_length
+            raw_words, raw_word_mask = self._reserve_word_cache(
+                model_output.past_word_embeddings[row],
+                model_output.past_word_mask[row],
+            )
+            raw_prompts, prompt_mask = self._compact_row(
+                model_output.cached_prompts_embedding[row],
+                model_output.cached_prompts_mask[row],
+            )
+            state = CacheState(
+                past_key_values=row_cache,
+                input_ids=torch.cat([cached.input_ids, current_ids]).detach(),
+                attention_mask=torch.ones(
+                    cached.cached_length + current_token_count,
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+                token_word_mask=torch.cat([cached.token_word_mask, current_word_mask]).detach(),
+                past_word_embeddings=raw_words.detach(),
+                past_word_mask=raw_word_mask.detach(),
+                prompts_embedding=raw_prompts.detach(),
+                prompts_mask=prompt_mask.detach(),
+                cached_length=cached.cached_length + current_token_count,
+                next_position_id=cached.next_position + current_token_count,
+                session_id=item["session_id"],
+                labels=item["labels"],
+                label_names=item["label_names"],
+                text=item["combined_text"],
+                tokens=item["combined_tokens"],
+                char_starts=item["combined_starts"],
+                char_ends=item["combined_ends"],
+                span_logits=self._merge_session_span_logits(
+                    item["state"].span_logits,
+                    model_output,
+                    batch_index=row,
+                    class_count=len(item["labels"]),
+                ),
+            )
+            states.append(state)
+        for state in states:
+            self._session_cache.put(state)
+        return states
+
+    @torch.inference_mode()
+    def _run_session_items_batched(self, requests, *, return_exceptions=False):
+        """Batch compatible session appends and return results in request order."""
+        with self._stream_execution_lock:
+            if not requests:
+                return []
+            session_ids = [request["session_id"] for request in requests]
+            if len(set(session_ids)) != len(session_ids):
+                raise ValueError("Duplicate session IDs in one streaming batch are ambiguous")
+
+            prepared = [None] * len(requests)
+            results = [None] * len(requests)
+            for index, request in enumerate(requests):
+                try:
+                    prepared[index] = self._prepare_session_item(
+                        request["text"],
+                        request["labels"],
+                        request["session_id"],
+                        request.get("recompute", False),
+                        label_names=request.get("label_names"),
+                    )
+                except Exception as error:
+                    results[index] = error
+
+            groups = {}
+            for index, item in enumerate(prepared):
+                if item is None:
+                    continue
+                key = (
+                    (
+                        "full",
+                        0,
+                    )
+                    if item["full_recompute"]
+                    else (
+                        "incremental",
+                        item["state"].cached_length,
+                    )
+                )
+                groups.setdefault(key, []).append(index)
+
+            for (kind, _), indices in groups.items():
+                group_items = [prepared[index] for index in indices]
+                try:
+                    if kind == "full":
+                        group_states = self._run_full_session_batch(group_items)
+                    else:
+                        group_states = self._run_incremental_session_batch(group_items)
+                except Exception as error:
+                    for index in indices:
+                        results[index] = error
+                    continue
+
+                for index, state in zip(indices, group_states, strict=False):
+                    request = requests[index]
+                    try:
+                        results[index] = self._decode_session_output(
+                            state,
+                            request.get("threshold", 0.5),
+                            request.get("flat_ner", True),
+                            request.get("multi_label", False),
+                            request.get("return_class_probs", False),
+                        )
+                    except Exception as error:
+                        results[index] = error
+
+            if not return_exceptions:
+                for result in results:
+                    if isinstance(result, Exception):
+                        raise result
+            return results
+
+    def _run_session_item(
+        self,
+        text,
+        labels,
+        session_id,
+        recompute,
+        threshold,
+        flat_ner,
+        multi_label,
+        return_class_probs,
+    ):
+        item = self._prepare_session_item(text, labels, session_id, recompute)
+        state = item["state"]
+        current_tokens = item["current_tokens"]
+        combined_text = item["combined_text"]
+        combined_tokens = item["combined_tokens"]
+        combined_starts = item["combined_starts"]
+        combined_ends = item["combined_ends"]
+
+        full_recompute = item["full_recompute"]
+        if full_recompute:
+            batch = self._collate_session_tokens(combined_tokens, labels, include_prompt=True)
+            batch = {
+                key: value.to(self.device) if isinstance(value, torch.Tensor) else value for key, value in batch.items()
+            }
+            token_count = int(batch["attention_mask"].sum().item())
+            self._validate_context_length(token_count, session_id)
+            model_output = self.model(**batch, past_key_values=self._create_session_cache())
+            batch["label_attention_mask"] = batch["attention_mask"]
+            new_state = self._state_from_output(
+                session_id,
+                labels,
+                batch,
+                model_output,
+                combined_text,
+                combined_tokens,
+                combined_starts,
+                combined_ends,
+            )
+        else:
+            batch = self._collate_session_tokens(current_tokens, labels, include_prompt=False)
+            batch = {
+                key: value.to(self.device) if isinstance(value, torch.Tensor) else value for key, value in batch.items()
+            }
+            current_attention = batch["attention_mask"]
+            current_token_count = int(current_attention.sum().item())
+            self._validate_context_length(state.cached_length + current_token_count, session_id)
+
+            past_words = state.word_length
+            new_words = len(current_tokens)
+            recompute_spans = self.model.span_rep_layer.uses_bidirectional_context
+            right_context_width = getattr(self.config, "right_context_width", None)
+            if right_context_width is None:
+                right_context_width = self.config.max_width
+            span_idx, span_mask = prepare_streaming_span_idx(
+                past_words,
+                new_words,
+                self.config.max_width,
+                recompute_all=recompute_spans,
+                right_context_width=right_context_width,
+            )
+            batch["span_idx"] = span_idx.unsqueeze(0).to(self.device)
+            batch["span_mask"] = span_mask.unsqueeze(0).to(self.device)
+
+            cached = state.to(self.device)
+            full_attention = torch.cat(
+                [cached.attention_mask.unsqueeze(0), current_attention],
+                dim=1,
+            )
+            position_ids = torch.arange(
+                cached.next_position,
+                cached.next_position + batch["input_ids"].size(1),
+                device=self.device,
+            ).unsqueeze(0)
+            try:
+                model_output = self.model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=full_attention,
+                    label_attention_mask=current_attention,
+                    # Same-device CacheState.to() returns this exact cache object.
+                    # ReusableDynamicLayer writes only the newly appended KV slice
+                    # and retains its backing storage until a capacity boundary.
+                    past_word_length=past_words,
+                    past_key_values=cached.past_key_values,
+                    past_word_embeddings=cached.past_word_embeddings.unsqueeze(0),
+                    past_word_mask=cached.past_word_mask.unsqueeze(0),
+                    prompts_embedding=cached.prompts_embedding.unsqueeze(0),
+                    prompts_embedding_mask=cached.prompts_mask.unsqueeze(0),
+                    words_mask=batch["words_mask"],
+                    text_lengths=batch["text_lengths"],
+                    span_idx=batch["span_idx"],
+                    span_mask=batch["span_mask"],
+                    position_ids=position_ids,
+                )
+            except Exception:
+                # KV layers append in place, so a partially failed decoder pass
+                # cannot safely be retried from the previous session metadata.
+                self.clear_session(session_id)
+                raise
+
+            valid_current = current_attention[0].bool()
+            current_ids = batch["input_ids"][0][valid_current]
+            current_word_mask = batch["words_mask"][0][valid_current].clone()
+            current_word_mask[current_word_mask > 0] += past_words
+            raw_words = model_output.past_word_embeddings[0]
+            raw_word_mask = model_output.past_word_mask[0]
+            raw_prompts, prompt_mask = self._compact_row(
+                model_output.cached_prompts_embedding[0],
+                model_output.cached_prompts_mask[0],
+            )
+            new_state = CacheState(
+                past_key_values=model_output.past_key_values,
+                input_ids=torch.cat([cached.input_ids, current_ids]).detach(),
+                attention_mask=torch.ones(
+                    cached.cached_length + current_token_count,
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+                token_word_mask=torch.cat([cached.token_word_mask, current_word_mask]).detach(),
+                past_word_embeddings=raw_words.detach(),
+                past_word_mask=raw_word_mask.detach(),
+                prompts_embedding=raw_prompts.detach(),
+                prompts_mask=prompt_mask.detach(),
+                cached_length=cached.cached_length + current_token_count,
+                next_position_id=cached.next_position + current_token_count,
+                session_id=session_id,
+                labels=tuple(labels),
+                text=combined_text,
+                tokens=combined_tokens,
+                char_starts=combined_starts,
+                char_ends=combined_ends,
+                span_logits=self._merge_session_span_logits(state.span_logits, model_output),
+            )
+
+        self._session_cache.put(new_state)
+        return self._decode_session_output(
+            new_state,
+            threshold,
+            flat_ner,
+            multi_label,
+            return_class_probs,
+        )
+
+    @torch.no_grad()
+    def inference(
+        self,
+        texts: str | List[str],
+        labels: EntityLabels,
+        flat_ner: bool = True,
+        threshold: float = 0.5,
+        multi_label: bool = False,
+        batch_size: int = 8,
+        packing_config: InferencePackingConfig | None = None,
+        input_spans: List[List[Dict]] | None = None,
+        return_class_probs: bool = False,
+        session_id: List[str] | None = None,
+        recompute: bool = False,
+        *,
+        return_vectors: bool = False,
+        return_label_vectors: bool = False,
+        **external_inputs,
+    ):
+        """Run stateless inference or append to cached streaming-span sessions.
+
+        Session calls reuse the causal decoder cache and rescore spans within
+        ``config.right_context_width`` of the newest word.  ``recompute=True``
+        takes precedence and refreshes every span over the combined session.
+        Returned entities are a complete session snapshot, including any
+        revisions or removals caused by the newly appended context.
+        Labels support shared or per-text label-to-description mappings, just
+        as in stateless inference. Changing names or descriptions in an existing
+        session requires ``recompute=True`` or clearing the session.
+        """
+        if session_id is None:
+            return super().inference(
+                texts,
+                labels,
+                flat_ner=flat_ner,
+                threshold=threshold,
+                multi_label=multi_label,
+                batch_size=batch_size,
+                packing_config=packing_config,
+                input_spans=input_spans,
+                return_class_probs=return_class_probs,
+                return_vectors=return_vectors,
+                return_label_vectors=return_label_vectors,
+                **external_inputs,
+            )
+        if return_vectors or return_label_vectors:
+            raise NotImplementedError(
+                "Entity and label vectors are not yet available for stateful streaming inference; "
+                "use stateless inference or recompute outside a session"
+            )
+        if external_inputs:
+            raise ValueError("external model inputs are not supported with session inference")
+        if packing_config is not None:
+            raise ValueError("inference packing is not supported with session inference")
+        if input_spans is not None:
+            raise ValueError("input_spans are not supported with session inference")
+        if isinstance(texts, str):
+            texts = [texts]
+        if not isinstance(session_id, list) or not all(isinstance(value, str) for value in session_id):
+            raise TypeError("session_id must be a list of strings")
+        if len(session_id) != len(texts):
+            raise ValueError("session_id must have one value per input text")
+        if len(set(session_id)) != len(session_id):
+            raise ValueError("Duplicate session IDs in one inference call are ambiguous")
+        if not isinstance(recompute, bool):
+            raise TypeError("recompute must be a boolean")
+
+        normalized_labels, label_names = _normalize_labels(labels, len(texts), list(range(len(texts))))
+        per_text_labels = bool(normalized_labels) and isinstance(normalized_labels[0], list)
+        if not normalized_labels or (per_text_labels and any(not label_set for label_set in normalized_labels)):
+            raise ValueError("At least one label is required")
+        if not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        self.eval()
+        outputs = [[] for _ in texts]
+        requests = []
+        request_indices = []
+        for index, (text, current_session) in enumerate(zip(texts, session_id, strict=False)):
+            if not isinstance(text, str) or not text.strip():
+                continue
+            request_indices.append(index)
+            requests.append(
+                {
+                    "text": text,
+                    "labels": normalized_labels[index] if per_text_labels else normalized_labels,
+                    "label_names": label_names[index] if per_text_labels else label_names,
+                    "session_id": current_session,
+                    "recompute": recompute,
+                    "threshold": threshold,
+                    "flat_ner": flat_ner,
+                    "multi_label": multi_label,
+                    "return_class_probs": return_class_probs,
+                }
+            )
+
+        for offset in range(0, len(requests), batch_size):
+            request_batch = requests[offset : offset + batch_size]
+            decoded_batch = self._run_session_items_batched(request_batch)
+            for index, decoded in zip(
+                request_indices[offset : offset + batch_size],
+                decoded_batch,
+                strict=False,
+            ):
+                outputs[index] = decoded
+        return outputs
+
+
 class UniEncoderTokenGLiNER(BaseEncoderGLiNER):
     config_class = UniEncoderTokenConfig
     model_class = UniEncoderTokenModel
-    ort_model_class: type = UniEncoderTokenORTModel
     data_processor_class = UniEncoderTokenProcessor
     data_collator_class = UniEncoderTokenDataCollator
     decoder_class = TokenDecoder
@@ -3109,7 +5226,6 @@ class UniEncoderTokenGLiNER(BaseEncoderGLiNER):
 class BiEncoderSpanGLiNER(BaseBiEncoderGLiNER):
     config_class = BiEncoderSpanConfig
     model_class = BiEncoderSpanModel
-    ort_model_class: type = BiEncoderSpanORTModel
     data_processor_class = BiEncoderSpanProcessor
     data_collator_class = BiEncoderSpanDataCollator
     decoder_class = SpanDecoder
@@ -3151,7 +5267,6 @@ class BiEncoderSpanGLiNER(BaseBiEncoderGLiNER):
 class BiEncoderTokenGLiNER(BaseBiEncoderGLiNER):
     config_class = BiEncoderTokenConfig
     model_class = BiEncoderTokenModel
-    ort_model_class: type = BiEncoderTokenORTModel
     data_processor_class = BiEncoderTokenProcessor
     data_collator_class = BiEncoderTokenDataCollator
     decoder_class = TokenDecoder
@@ -3194,25 +5309,28 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
 
     config_class = UniEncoderSpanDecoderConfig  # Uses base config with labels_decoder settings
     model_class = UniEncoderSpanDecoderModel
-    ort_model_class: type = None
     data_processor_class = UniEncoderSpanDecoderProcessor
     data_collator_class = UniEncoderSpanDecoderDataCollator
     decoder_class = SpanGenerativeDecoder
 
-    def _create_data_processor(self, config, cache_dir, tokenizer=None, words_splitter=None, **kwargs):
+    def _create_data_processor(
+        self, config, cache_dir, tokenizer=None, words_splitter=None, local_files_only=False, **kwargs
+    ):
         """Create data processor with decoder tokenizer."""
         if tokenizer is None:
-            tokenizer = AutoTokenizer.from_pretrained(config.model_name, cache_dir=cache_dir)
+            tokenizer = AutoTokenizer.from_pretrained(
+                config.model_name, cache_dir=cache_dir, local_files_only=local_files_only
+            )
             self._set_tokenizer_spec_tokens(tokenizer)
 
         if words_splitter is None:
             words_splitter = WordsSplitter(config.words_splitter_type)
 
         # Load decoder tokenizer
-        decoder_tokenizer = None
-        if config.labels_decoder is not None:
+        decoder_tokenizer = kwargs.get("decoder_tokenizer")
+        if decoder_tokenizer is None and config.labels_decoder is not None:
             decoder_tokenizer = AutoTokenizer.from_pretrained(
-                config.labels_decoder, cache_dir=cache_dir, add_prefix_space=True
+                config.labels_decoder, cache_dir=cache_dir, add_prefix_space=True, local_files_only=local_files_only
             )
             if decoder_tokenizer.pad_token is None:
                 decoder_tokenizer.pad_token = decoder_tokenizer.eos_token
@@ -3284,10 +5402,11 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
         self,
         batch: Dict[str, Any],
         threshold: float = 0.5,
-        packing_config: Optional[InferencePackingConfig] = None,
+        packing_config: InferencePackingConfig | None = None,
         move_to_device: bool = True,
-        gen_constraints: Optional[List[str]] = None,
+        gen_constraints: List[str] | None = None,
         num_gen_sequences: int = 1,
+        return_vectors: bool = False,
         **gen_kwargs,
     ) -> Any:
         """Run model forward pass on a collated batch with label generation.
@@ -3299,15 +5418,18 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
             move_to_device: Whether to move tensors to model device.
             gen_constraints: Labels to constrain generation.
             num_gen_sequences: Number of label sequences to generate per span.
+            return_vectors: Whether to retain span representations for decoding.
             **gen_kwargs: Additional generation parameters.
 
         Returns:
             Model output with generated labels attached.
         """
-        if move_to_device and not self.onnx_model:
+        if move_to_device and not self.is_runtime_model:
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         model_inputs = batch.copy() if packing_config is None else {**batch, "packing_config": packing_config}
+        if return_vectors:
+            model_inputs["return_embeddings"] = True
         model_output = self.model(**model_inputs, threshold=threshold)
 
         # Generate labels if decoder is available
@@ -3329,11 +5451,13 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
         self,
         model_output: Any,
         batch: Dict[str, Any],
-        threshold: Union[float, List[float]] = 0.5,
-        flat_ner: Union[bool, List[bool]] = True,
-        multi_label: Union[bool, List[bool]] = False,
+        threshold: float | List[float] = 0.5,
+        flat_ner: bool | List[bool] = True,
+        multi_label: bool | List[bool] = False,
         return_class_probs: bool = False,
-        input_spans: Optional[List[List[Tuple[int, int]]]] = None,
+        input_spans: List[List[Tuple[int, int]]] | None = None,
+        return_vectors: bool = False,
+        return_label_vectors: bool = False,
     ) -> List[List[Any]]:
         """Decode model output into entity predictions with generated labels.
 
@@ -3345,6 +5469,8 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
             multi_label: Whether to allow multiple labels per span.
             return_class_probs: Whether to include class probabilities.
             input_spans: Optional word-level input spans to classify.
+            return_vectors: Whether to attach a contextual vector to every returned span.
+            return_label_vectors: Whether to attach the matched scoring-time label vector.
 
         Returns:
             List of entity lists (one per text in batch).
@@ -3363,8 +5489,18 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
             gen_labels=model_output.gen_labels,
             sel_idx=model_output.decoder_span_idx,
             num_gen_sequences=model_output.num_gen_sequences,
+            span_logits=model_output.span_logits,
+            span_idx=model_output.span_idx,
+            span_mask=model_output.span_mask,
             return_class_probs=return_class_probs,
             input_spans=input_spans,
+        )
+        _attach_entity_vectors(
+            decoded,
+            model_output,
+            self.config,
+            return_vectors=return_vectors,
+            return_label_vectors=return_label_vectors,
         )
         return decoded
 
@@ -3379,6 +5515,8 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
         word_input_spans=None,
         gen_constraints=None,
         num_gen_sequences=1,
+        return_vectors=False,
+        return_label_vectors=False,
         **gen_kwargs,
     ):
         """Batch processing logic with label generation support."""
@@ -3393,6 +5531,7 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
                 move_to_device=True,
                 gen_constraints=gen_constraints,
                 num_gen_sequences=num_gen_sequences,
+                return_vectors=return_vectors,
                 **gen_kwargs,
             )
 
@@ -3410,6 +5549,8 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
                 multi_label=multi_label,
                 return_class_probs=return_class_probs,
                 input_spans=batch_input_spans,
+                return_vectors=return_vectors,
+                return_label_vectors=return_label_vectors,
             )
             outputs.extend(decoded)
 
@@ -3463,6 +5604,12 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
                 if span.class_probs is not None:
                     entity["class_probs"] = span.class_probs
 
+                if getattr(span, "vector", None) is not None:
+                    entity["vector"] = span.vector
+
+                if getattr(span, "label_vector", None) is not None:
+                    entity["label_vector"] = span.label_vector
+
                 entities.append(entity)
 
             all_entities[orig_i] = entities
@@ -3472,17 +5619,20 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
     @torch.no_grad()
     def inference(
         self,
-        texts: Union[str, List[str]],
-        labels: List[str],
+        texts: str | List[str],
+        labels: EntityLabels,
         flat_ner: bool = True,
         threshold: float = 0.5,
         multi_label: bool = False,
         batch_size: int = 8,
-        gen_constraints: Optional[List[str]] = None,
+        gen_constraints: List[str] | None = None,
         num_gen_sequences: int = 1,
-        packing_config: Optional[InferencePackingConfig] = None,
-        input_spans: Optional[List[List[Dict]]] = None,
+        packing_config: InferencePackingConfig | None = None,
+        input_spans: List[List[Dict]] | None = None,
         return_class_probs: bool = False,
+        *,
+        return_vectors: bool = False,
+        return_label_vectors: bool = False,
         **gen_kwargs,
     ) -> List[List[Dict[str, Any]]]:
         """Predict entities with optional label generation.
@@ -3500,12 +5650,17 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
             input_spans: Input entity spans to limit predictions to. Each span is a dict
                 with 'start' and 'end' character positions.
             return_class_probs: Whether to include class probabilities in output. Defaults to False.
+            return_vectors: Whether to include a contextual vector for each returned entity.
+            return_label_vectors: Whether to include the matched label vector for each entity.
             **gen_kwargs: Additional generation parameters.
 
         Returns:
             List of entity predictions with optional generated labels.
         """
         self.eval()
+
+        if (return_vectors or return_label_vectors) and self.is_runtime_model:
+            raise NotImplementedError("Entity and label vectors are not available from the current runtime exports")
 
         prepared = self.prepare_batch(texts, labels, input_spans)
 
@@ -3514,11 +5669,20 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
 
         collator = self.create_collator()
 
-        def collate_fn(batch):
-            return self.collate_batch(batch, prepared["entity_types"], collator)
+        def collate_fn(indices):
+            entity_types = _entity_types_for_chunk(prepared["entity_types"], indices)
+            label_names = prepared.get("label_names")
+            label_names = entity_types if label_names is None else _entity_types_for_chunk(label_names, indices)
+            batch = self.collate_batch(
+                [prepared["input_x"][i] for i in indices],
+                entity_types,
+                collator,
+            )
+            _remap_id_to_classes(batch, entity_types, label_names)
+            return batch
 
         data_loader = torch.utils.data.DataLoader(
-            prepared["input_x"],
+            list(range(len(prepared["input_x"]))),
             batch_size=batch_size,
             shuffle=False,
             collate_fn=collate_fn,
@@ -3536,6 +5700,8 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
             word_input_spans=prepared["word_input_spans"],
             gen_constraints=gen_constraints,
             num_gen_sequences=num_gen_sequences,
+            return_vectors=return_vectors,
+            return_label_vectors=return_label_vectors,
             **gen_kwargs,
         )
 
@@ -3553,13 +5719,16 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
     def predict_entities(
         self,
         text: str,
-        labels: List[str],
+        labels: EntityLabels,
         flat_ner: bool = True,
         threshold: float = 0.5,
         multi_label: bool = False,
-        gen_constraints: Optional[List[str]] = None,
+        gen_constraints: List[str] | None = None,
         num_gen_sequences: int = 1,
         return_class_probs: bool = False,
+        *,
+        return_vectors: bool = False,
+        return_label_vectors: bool = False,
         **gen_kwargs,
     ) -> List[Dict[str, Any]]:
         """Predict entities for a single text input with optional label generation.
@@ -3573,6 +5742,8 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
             gen_constraints: Labels to constrain generation.
             num_gen_sequences: Number of label sequences to generate per span.
             return_class_probs: Whether to include class probabilities in output. Defaults to False.
+            return_vectors: Whether to include a contextual vector for each returned entity.
+            return_label_vectors: Whether to include the matched label vector for each entity.
             **gen_kwargs: Additional generation parameters.
 
         Returns:
@@ -3587,17 +5758,19 @@ class UniEncoderSpanDecoderGLiNER(BaseEncoderGLiNER):
             gen_constraints=gen_constraints,
             num_gen_sequences=num_gen_sequences,
             return_class_probs=return_class_probs,
+            return_vectors=return_vectors,
+            return_label_vectors=return_label_vectors,
             **gen_kwargs,
         )[0]
 
     def export_to_onnx(
         self,
-        save_dir: Union[str, Path],
+        save_dir: str | Path,
         onnx_filename: str = "model.onnx",
         quantized_filename: str = "model_quantized.onnx",
         quantize: bool = False,
         opset: int = 19,
-    ) -> dict[str, Optional[str]]:
+    ) -> dict[str, str | None]:
         """
         ONNX export not supported for encoder-decoder models.
 
@@ -3624,7 +5797,6 @@ class UniEncoderTokenDecoderGLiNER(UniEncoderSpanDecoderGLiNER):
 
     config_class = UniEncoderTokenDecoderConfig
     model_class = UniEncoderTokenDecoderModel
-    ort_model_class = None
     data_processor_class = UniEncoderTokenDecoderProcessor
     data_collator_class = UniEncoderTokenDecoderDataCollator
     decoder_class = TokenGenerativeDecoder
@@ -3639,15 +5811,18 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
 
     config_class = UniEncoderSpanRelexConfig
     model_class = UniEncoderSpanRelexModel
-    ort_model_class: type = UniEncoderSpanRelexORTModel
     data_processor_class = RelationExtractionSpanProcessor
     data_collator_class = RelationExtractionSpanDataCollator
     decoder_class = SpanRelexDecoder
 
-    def _create_data_processor(self, config, cache_dir, tokenizer=None, words_splitter=None, **kwargs):
+    def _create_data_processor(
+        self, config, cache_dir, tokenizer=None, words_splitter=None, local_files_only=False, **kwargs
+    ):
         """Create relation extraction data processor."""
         if tokenizer is None:
-            tokenizer = AutoTokenizer.from_pretrained(config.model_name, cache_dir=cache_dir)
+            tokenizer = AutoTokenizer.from_pretrained(
+                config.model_name, cache_dir=cache_dir, local_files_only=local_files_only
+            )
             self._set_tokenizer_spec_tokens(tokenizer)
 
         if words_splitter is None:
@@ -3675,17 +5850,17 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
 
     def prepare_batch(
         self,
-        texts: Union[str, List[str]],
-        labels: Union[str, List[str], List[List[str]]],
-        input_spans: Optional[List[List[Dict]]] = None,
-        relations: Optional[Union[str, List[str], List[List[str]]]] = None,
+        texts: str | List[str],
+        labels: EntityLabels,
+        input_spans: List[List[Dict]] | None = None,
+        relations: str | List[str] | List[List[str]] | None = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """Prepare raw inputs for inference including relation types.
 
         Args:
             texts: Single text string or list of texts.
-            labels: Entity labels - string, list of strings, or per-text label lists.
+            labels: Shared or per-text entity labels, optionally mapped to descriptions.
             input_spans: Optional pre-defined spans to classify (character positions).
             relations: Relation type labels - string, list of strings, or per-text label lists.
             **kwargs: Additional keyword arguments passed to the parent prepare_batch.
@@ -3716,9 +5891,10 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
     def collate_batch(
         self,
         input_x: List[Dict[str, Any]],
-        entity_types: Union[List[str], List[List[str]]],
-        collator: Optional[Any] = None,
-        relation_types: Optional[Union[List[str], List[List[str]]]] = None,
+        entity_types: List[str] | List[List[str]],
+        collator: Any | None = None,
+        relation_types: List[str] | List[List[str]] | None = None,
+        label_names: List[str] | List[List[str]] | None = None,
     ) -> Dict[str, Any]:
         """Collate prepared inputs into a tensor batch with relation types.
 
@@ -3727,6 +5903,7 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             entity_types: Entity type labels.
             collator: Optional pre-created collator instance.
             relation_types: Relation type labels (list or per-text lists).
+            label_names: Optional public names corresponding to model-facing entity prompts.
 
         Returns:
             Collated batch dictionary with tensors ready for the model.
@@ -3738,6 +5915,7 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             relation_types = []
 
         batch = collator(input_x, entity_types=entity_types, relation_types=relation_types)
+        _remap_id_to_classes(batch, entity_types, label_names)
         return batch
 
     def create_collator(self) -> Any:
@@ -3761,9 +5939,10 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         self,
         batch: Dict[str, Any],
         threshold: float = 0.5,
-        adjacency_threshold: Optional[float] = None,
-        packing_config: Optional[InferencePackingConfig] = None,
+        adjacency_threshold: float | None = None,
+        packing_config: InferencePackingConfig | None = None,
         move_to_device: bool = True,
+        return_vectors: bool = False,
         **external_inputs,
     ) -> Any:
         """Run model forward pass on a collated batch.
@@ -3774,6 +5953,7 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             adjacency_threshold: Threshold for adjacency matrix reconstruction.
             packing_config: Optional inference packing configuration.
             move_to_device: Whether to move tensors to model device.
+            return_vectors: Whether to retain entity and relation representations for decoding.
             **external_inputs: Additional inputs to pass to the model.
 
         Returns:
@@ -3782,7 +5962,7 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         if adjacency_threshold is None:
             adjacency_threshold = threshold
 
-        if move_to_device and not self.onnx_model:
+        if move_to_device and not self.is_runtime_model:
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         if packing_config is not None or external_inputs:
@@ -3792,6 +5972,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         else:
             model_inputs = batch
 
+        if return_vectors:
+            model_inputs = {**model_inputs, "return_embeddings": True}
         model_output = self.model(**model_inputs, threshold=threshold, adjacency_threshold=adjacency_threshold)
         return model_output
 
@@ -3799,12 +5981,14 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         self,
         model_output: Any,
         batch: Dict[str, Any],
-        threshold: Union[float, List[float]] = 0.5,
-        relation_threshold: Optional[Union[float, List[float]]] = None,
-        flat_ner: Union[bool, List[bool]] = True,
-        multi_label: Union[bool, List[bool]] = False,
+        threshold: float | List[float] = 0.5,
+        relation_threshold: float | List[float] | None = None,
+        flat_ner: bool | List[bool] = True,
+        multi_label: bool | List[bool] = False,
         return_class_probs: bool = False,
-        input_spans: Optional[List[List[Tuple[int, int]]]] = None,
+        input_spans: List[List[Tuple[int, int]]] | None = None,
+        return_vectors: bool = False,
+        return_label_vectors: bool = False,
     ) -> Tuple[List[List[Any]], List[List[Any]]]:
         """Decode model output into entity and relation predictions.
 
@@ -3817,6 +6001,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             multi_label: Whether to allow multiple labels per span.
             return_class_probs: Whether to include class probabilities.
             input_spans: Optional word-level input spans to classify.
+            return_vectors: Whether to attach entity and relation representations.
+            return_label_vectors: Whether to attach matched entity and relation label vectors.
 
         Returns:
             Tuple of (entity_outputs, relation_outputs) where each is a list per text.
@@ -3857,6 +6043,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             multi_label=multi_label,
             rel_id_to_classes=batch["rel_id_to_classes"],
             entity_spans=entity_spans,
+            return_class_probs=return_class_probs,
+            input_spans=input_spans,
         )
 
         if len(decoded_results) == 2:
@@ -3864,6 +6052,20 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         else:
             decoded_entities = decoded_results
             decoded_relations = [[] for _ in range(len(batch["tokens"]))]
+
+        _attach_entity_vectors(
+            decoded_entities,
+            model_output,
+            self.config,
+            return_vectors=return_vectors,
+            return_label_vectors=return_label_vectors,
+        )
+        _attach_relation_vectors(
+            decoded_relations,
+            model_output,
+            return_vectors=return_vectors,
+            return_label_vectors=return_label_vectors,
+        )
 
         return decoded_entities, decoded_relations
 
@@ -3879,6 +6081,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         adjacency_threshold=None,
         relation_threshold=None,
         return_relations=True,
+        return_vectors=False,
+        return_label_vectors=False,
         **external_inputs,
     ):
         """Batch processing logic for entity and relation extraction."""
@@ -3893,6 +6097,7 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
                 adjacency_threshold=adjacency_threshold,
                 packing_config=packing_config,
                 move_to_device=True,
+                return_vectors=return_vectors,
                 **external_inputs,
             )
 
@@ -3911,6 +6116,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
                 multi_label=multi_label,
                 return_class_probs=return_class_probs,
                 input_spans=batch_input_spans,
+                return_vectors=return_vectors,
+                return_label_vectors=return_label_vectors,
             )
 
             all_entity_outputs.extend(decoded_entities)
@@ -3967,6 +6174,12 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
                 if span.class_probs is not None:
                     entity["class_probs"] = span.class_probs
 
+                if getattr(span, "vector", None) is not None:
+                    entity["vector"] = span.vector
+
+                if getattr(span, "label_vector", None) is not None:
+                    entity["label_vector"] = span.label_vector
+
                 entities.append(entity)
 
             all_entities[orig_i] = entities
@@ -4010,25 +6223,28 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
     @torch.no_grad()
     def inference(
         self,
-        texts: Union[str, List[str]],
-        labels: Union[str, List[str], List[List[str]]],
-        relations: Union[str, List[str], List[List[str]]] = [],
+        texts: str | List[str],
+        labels: EntityLabels,
+        relations: str | List[str] | List[List[str]] = [],
         flat_ner: bool = True,
         threshold: float = 0.5,
-        adjacency_threshold: Optional[float] = None,
-        relation_threshold: Optional[float] = None,
+        adjacency_threshold: float | None = None,
+        relation_threshold: float | None = None,
         multi_label: bool = False,
         batch_size: int = 8,
-        packing_config: Optional[InferencePackingConfig] = None,
-        input_spans: Optional[List[List[Dict]]] = None,
+        packing_config: InferencePackingConfig | None = None,
+        input_spans: List[List[Dict]] | None = None,
         return_relations: bool = True,
         return_class_probs: bool = False,
-    ) -> Union[List[List[Dict[str, Any]]], Tuple[List[List[Dict[str, Any]]], List[List[Dict[str, Any]]]]]:
+        *,
+        return_vectors: bool = False,
+        return_label_vectors: bool = False,
+    ) -> List[List[Dict[str, Any]]] | Tuple[List[List[Dict[str, Any]]], List[List[Dict[str, Any]]]]:
         """Predict entities and relations.
 
         Args:
             texts: Input texts (str or List[str]).
-            labels: Entity type labels - string, list of strings, or per-text label lists.
+            labels: Shared or per-text entity labels, optionally mapped to descriptions.
             relations: Relation type labels - string, list of strings, or per-text label lists.
             flat_ner: Whether to use flat NER (no nested entities).
             threshold: Confidence threshold for entities.
@@ -4041,11 +6257,18 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
                 with 'start' and 'end' character positions.
             return_relations: Whether to return relation predictions.
             return_class_probs: Whether to include class probabilities in output. Defaults to False.
+            return_vectors: Whether to include contextual entity and relation representations.
+            return_label_vectors: Whether to include matched entity and relation label vectors.
 
         Returns:
             Tuple of (entities, relations) if return_relations=True, else just entities.
         """
         self.eval()
+
+        if (return_vectors or return_label_vectors) and self.is_runtime_model:
+            raise NotImplementedError(
+                "Entity, label, and relation vectors are not available from the current ONNX/OpenVINO exports"
+            )
 
         prepared = self.prepare_batch(texts, labels, input_spans, relations)
 
@@ -4062,11 +6285,21 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
 
         collator = self.create_collator()
 
-        def collate_fn(batch):
-            return self.collate_batch(batch, prepared["entity_types"], collator, prepared["relation_types"])
+        def collate_fn(indices):
+            entity_types = _entity_types_for_chunk(prepared["entity_types"], indices)
+            label_names = prepared.get("label_names")
+            label_names = entity_types if label_names is None else _entity_types_for_chunk(label_names, indices)
+            batch = self.collate_batch(
+                [prepared["input_x"][i] for i in indices],
+                entity_types,
+                collator,
+                _entity_types_for_chunk(prepared["relation_types"], indices),
+            )
+            _remap_id_to_classes(batch, entity_types, label_names)
+            return batch
 
         data_loader = torch.utils.data.DataLoader(
-            prepared["input_x"],
+            list(range(len(prepared["input_x"]))),
             batch_size=batch_size,
             shuffle=False,
             collate_fn=collate_fn,
@@ -4085,6 +6318,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             adjacency_threshold=adjacency_threshold,
             relation_threshold=relation_threshold,
             return_relations=return_relations,
+            return_vectors=return_vectors,
+            return_label_vectors=return_label_vectors,
         )
 
         all_entities = self.map_entities_to_text(
@@ -4113,13 +6348,16 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
     def predict_entities(
         self,
         text: str,
-        labels: List[str],
+        labels: EntityLabels,
         relations: List[str] = [],
         flat_ner: bool = True,
         threshold: float = 0.5,
-        adjacency_threshold: Optional[float] = None,
+        adjacency_threshold: float | None = None,
         multi_label: bool = False,
         return_class_probs: bool = False,
+        *,
+        return_vectors: bool = False,
+        return_label_vectors: bool = False,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """Predict entities for a single text input.
@@ -4133,6 +6371,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             adjacency_threshold: Threshold for adjacency matrix reconstruction. Defaults to threshold.
             multi_label: Whether to allow multiple labels per entity. Defaults to False.
             return_class_probs: Whether to include class probabilities in output. Defaults to False.
+            return_vectors: Whether to include a contextual vector for each returned entity.
+            return_label_vectors: Whether to include the matched label vector for each entity.
             **kwargs: Additional arguments passed to inference.
 
         Returns:
@@ -4148,19 +6388,24 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             multi_label=multi_label,
             return_relations=False,
             return_class_probs=return_class_probs,
+            return_vectors=return_vectors,
+            return_label_vectors=return_label_vectors,
             **kwargs,
         )[0]
 
     def predict_relations(
         self,
         text: str,
-        labels: List[str],
+        labels: EntityLabels,
         relations: List[str],
         flat_ner: bool = True,
         threshold: float = 0.5,
-        adjacency_threshold: Optional[float] = None,
-        relation_threshold: Optional[float] = None,
+        adjacency_threshold: float | None = None,
+        relation_threshold: float | None = None,
         multi_label: bool = False,
+        *,
+        return_vectors: bool = False,
+        return_label_vectors: bool = False,
         **kwargs,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Predict entities and relations for a single text input.
@@ -4174,6 +6419,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             adjacency_threshold: Threshold for adjacency matrix reconstruction. Defaults to threshold.
             relation_threshold: Confidence threshold for relations. Defaults to threshold.
             multi_label: Whether to allow multiple labels per entity. Defaults to False.
+            return_vectors: Whether to include contextual entity and relation representations.
+            return_label_vectors: Whether to include matched entity and relation label vectors.
             **kwargs: Additional arguments passed to inference.
 
         Returns:
@@ -4189,6 +6436,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             relation_threshold=relation_threshold,
             multi_label=multi_label,
             return_relations=True,
+            return_vectors=return_vectors,
+            return_label_vectors=return_label_vectors,
             **kwargs,
         )
         return entities[0], rels[0]
@@ -4239,7 +6488,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             end_token_idx_to_text_idx = all_end_token_idx_to_text_idx[valid_i]
 
             # Process each relation tuple from decoder
-            for head_idx, relation_label, tail_idx, score in rel_tuples:
+            for relation_output in rel_tuples:
+                head_idx, relation_label, tail_idx, score = relation_output
                 # Validate entity indices
                 if head_idx >= len(entities_list) or tail_idx >= len(entities_list):
                     continue
@@ -4254,26 +6504,35 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
                 tail_start_text = start_token_idx_to_text_idx[tail_span.start]
                 tail_end_text = end_token_idx_to_text_idx[tail_span.end]
 
-                relations.append(
-                    {
-                        "head": {
-                            "start": head_start_text,
-                            "end": head_end_text,
-                            "text": valid_texts[valid_i][head_start_text:head_end_text],
-                            "type": head_span.entity_type,
-                            "entity_idx": head_idx,
-                        },
-                        "tail": {
-                            "start": tail_start_text,
-                            "end": tail_end_text,
-                            "text": valid_texts[valid_i][tail_start_text:tail_end_text],
-                            "type": tail_span.entity_type,
-                            "entity_idx": tail_idx,
-                        },
-                        "relation": relation_label,
-                        "score": score,
-                    }
-                )
+                relation = {
+                    "head": {
+                        "start": head_start_text,
+                        "end": head_end_text,
+                        "text": valid_texts[valid_i][head_start_text:head_end_text],
+                        "type": head_span.entity_type,
+                        "entity_idx": head_idx,
+                    },
+                    "tail": {
+                        "start": tail_start_text,
+                        "end": tail_end_text,
+                        "text": valid_texts[valid_i][tail_start_text:tail_end_text],
+                        "type": tail_span.entity_type,
+                        "entity_idx": tail_idx,
+                    },
+                    "relation": relation_label,
+                    "score": score,
+                }
+
+                if getattr(relation_output, "vector", None) is not None:
+                    relation["vector"] = relation_output.vector
+                if getattr(relation_output, "label_vector", None) is not None:
+                    relation["label_vector"] = relation_output.label_vector
+                if getattr(relation_output, "head_relation_vector", None) is not None:
+                    relation["head_relation_vector"] = relation_output.head_relation_vector
+                if getattr(relation_output, "tail_relation_vector", None) is not None:
+                    relation["tail_relation_vector"] = relation_output.tail_relation_vector
+
+                relations.append(relation)
 
             all_relations[orig_i] = relations
 
@@ -4286,10 +6545,11 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         flat_ner: bool = False,
         multi_label: bool = False,
         threshold: float = 0.5,
-        adjacency_threshold: Optional[float] = None,
-        relation_threshold: Optional[float] = None,
+        adjacency_threshold: float | None = None,
+        relation_threshold: float | None = None,
         batch_size: int = 12,
-        entity_types: Optional[List[str]] = None,
+        entity_types: List[str] | None = None,
+        relation_types: List[str] | None = None,
     ) -> Tuple[Tuple[Any, float], Tuple[Any, float]]:
         """Evaluate the model on both NER and relation extraction tasks.
 
@@ -4302,6 +6562,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
             relation_threshold: The threshold for relation predictions. Defaults to threshold.
             batch_size: The batch size for evaluation. Defaults to 12.
             entity_types: Optional list of entity types to evaluate. If None, extracts from test data. Defaults to None.
+            relation_types: Optional list of relation types to evaluate. If None, extracts from test
+                data. Defaults to None.
 
         Returns:
             Tuple of ((ner_output, ner_f1), (rel_output, rel_f1)) containing:
@@ -4332,7 +6594,7 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
         )
 
         def collate_fn(batch):
-            return collator(batch, entity_types=entity_types)
+            return collator(batch, entity_types=entity_types, relation_types=relation_types)
 
         data_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
@@ -4343,7 +6605,7 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
 
         # Iterate over data batches
         for batch in data_loader:
-            if not self.onnx_model:
+            if not self.is_runtime_model:
                 batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}  # noqa: PLW2901
 
             # Get model predictions
@@ -4407,8 +6669,8 @@ class UniEncoderSpanRelexGLiNER(BaseEncoderGLiNER):
 
         # Evaluate Relations
         # Format data for relation evaluator: list of (entities, relations) tuples
-        all_true_rel_data = list(zip(all_true_entities, all_true_relations))
-        all_pred_rel_data = list(zip(all_entity_preds, all_relation_preds))
+        all_true_rel_data = list(zip(all_true_entities, all_true_relations, strict=False))
+        all_pred_rel_data = list(zip(all_entity_preds, all_relation_preds, strict=False))
 
         rel_evaluator = BaseRelexEvaluator(all_true_rel_data, all_pred_rel_data)
         rel_output, rel_f1 = rel_evaluator.evaluate()
@@ -4501,7 +6763,6 @@ class UniEncoderTokenRelexGLiNER(UniEncoderSpanRelexGLiNER):
 
     config_class = UniEncoderTokenRelexConfig
     model_class = UniEncoderTokenRelexModel
-    ort_model_class: type = UniEncoderTokenRelexORTModel
     data_processor_class = RelationExtractionTokenProcessor
     data_collator_class = RelationExtractionTokenDataCollator
     decoder_class = TokenRelexDecoder
@@ -4610,7 +6871,7 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
         >>> model = GLiNER(config)
     """
 
-    def __init__(self, config: Union[str, Path, GLiNERConfig], **kwargs):
+    def __init__(self, config: str | Path | GLiNERConfig, **kwargs):
         """Initialize a GLiNER model with automatic type detection.
 
         This constructor determines the appropriate GLiNER variant based on the configuration
@@ -4633,11 +6894,11 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
             if config_path.exists():
                 with open(config_path) as f:
                     config_dict = json.load(f)
-                config = GLiNERConfig(**config_dict)
+                config = self._config_from_dict(config_dict)
             else:
                 raise FileNotFoundError(f"Config file not found: {config}")
         elif isinstance(config, dict):
-            config = GLiNERConfig(**config)
+            config = self._config_from_dict(config)
 
         # Determine the appropriate GLiNER class based on config
         gliner_class = self._get_gliner_class(config)
@@ -4652,6 +6913,9 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
     @staticmethod
     def _get_gliner_class(config: GLiNERConfig):
         """Determine the appropriate GLiNER class based on configuration."""
+        if isinstance(config, StreamingSpanConfig) or getattr(config, "model_type", None) == "gliner_streaming_span":
+            return StreamingSpanGLiNER
+
         is_token_level = config.span_mode == "token_level"
         has_labels_encoder = config.labels_encoder is not None
         has_labels_decoder = config.labels_decoder is not None
@@ -4680,38 +6944,48 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
             else:
                 return BiEncoderSpanGLiNER
 
-        if is_token_level:
-            return UniEncoderTokenGLiNER
-        else:
-            return UniEncoderSpanGLiNER
+        return UniEncoderTokenGLiNER if is_token_level else UniEncoderSpanGLiNER
+
+    @staticmethod
+    def _config_from_dict(config_dict: dict) -> BaseGLiNERConfig:
+        """Build the architecture-specific config encoded in a saved dictionary."""
+        config_dict = config_dict.copy()
+        model_type = config_dict.pop("model_type", None)
+        if model_type == "gliner_streaming_span":
+            return StreamingSpanConfig(**config_dict)
+        return GLiNERConfig(**config_dict)
 
     @classmethod
-    def from_pretrained(
+    # Keep positional compatibility for downstream callers of this public loading API.
+    def from_pretrained(  # noqa: PLR0917, RUF100
         cls,
         model_id: str,
-        revision: Optional[str] = None,
-        cache_dir: Optional[Union[str, Path]] = None,
+        revision: str | None = None,
+        cache_dir: str | Path | None = None,
         force_download: bool = False,
-        proxies: Optional[dict] = None,
+        proxies: dict | None = None,
         resume_download: bool = False,
         local_files_only: bool = False,
-        token: Union[str, bool, None] = None,
+        token: str | bool | None = None,
         map_location: str = "cpu",
         strict: bool = False,
-        load_tokenizer: Optional[bool] = None,
-        resize_token_embeddings: Optional[bool] = True,
-        compile_torch_model: Optional[bool] = False,
-        quantize: Optional[str] = None,
-        dtype: Optional[Union[str, torch.dtype]] = None,
+        load_tokenizer: bool | None = None,
+        resize_token_embeddings: bool | None = True,
+        compile_torch_model: bool | None = False,
+        quantize: str | None = None,
+        dtype: str | torch.dtype | None = None,
         low_cpu_mem_usage: bool = False,
-        variant: Optional[str] = None,
-        load_onnx_model: Optional[bool] = False,
-        onnx_model_file: Optional[str] = "model.onnx",
+        variant: str | None = None,
+        load_onnx_model: bool | None = False,
+        onnx_model_file: str | None = "model.onnx",
         # Config overrides
-        max_length: Optional[int] = None,
-        max_width: Optional[int] = None,
-        post_fusion_schema: Optional[str] = None,
-        _attn_implementation: Optional[str] = None,
+        max_length: int | None = None,
+        max_width: int | None = None,
+        post_fusion_schema: str | None = None,
+        _attn_implementation: str | None = None,
+        runtime: str | None = None,
+        runtime_model_file: str | None = None,
+        runtime_options: dict | None = None,
         **model_kwargs,
     ):
         """Load a pretrained GLiNER model with automatic type detection.
@@ -4758,6 +7032,10 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
             max_width: Override max_width in config.
             post_fusion_schema: Override post_fusion_schema in config.
             _attn_implementation: Override attention implementation.
+            runtime: Inference runtime: ``"torch"``, ``"onnxruntime"``, or
+                ``"openvino"``.
+            runtime_model_file: Runtime artifact relative to the model directory.
+            runtime_options: Backend-specific session or compilation options.
             **model_kwargs: Additional model initialization arguments.
 
         Returns:
@@ -4771,43 +7049,50 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
             >>> # If the repo publishes model.bf16.safetensors, download only that:
             >>> model = GLiNER.from_pretrained("org/gliner_bf16-v1", variant="bf16")
         """
+        normalized_runtime = BaseGLiNER._normalize_runtime(runtime, load_onnx_model=bool(load_onnx_model))
+        BaseGLiNER._validate_runtime_only_options(
+            normalized_runtime,
+            variant=variant,
+            dtype=dtype,
+            quantize=quantize,
+            compile_torch_model=bool(compile_torch_model),
+            low_cpu_mem_usage=low_cpu_mem_usage,
+        )
+
         # Canonicalize variant up front so it can narrow the download. The
         # outer ``GLiNER`` class doesn't inherit from ``BaseGLiNER``; reuse
         # the helpers directly so behavior stays in lockstep.
-        normalized_variant = BaseGLiNER._normalize_variant(variant)
+        normalized_variant = None
+        if normalized_runtime == "torch":
+            normalized_variant = BaseGLiNER._normalize_variant(variant)
 
-        # dtype-vs-variant consistency check MUST run before the probe.
-        # Otherwise, when the variant file is missing on the Hub,
-        # ``_resolve_variant`` downgrades to ``None`` and the inner
-        # ``from_pretrained``'s consistency check is skipped — silently
-        # accepting a ``variant="bf16", dtype="fp16"`` mismatch instead of
-        # raising as documented.
-        torch_dtype = BaseGLiNER._parse_dtype(dtype)
-        if normalized_variant is not None:
-            variant_dtype = BaseGLiNER._VARIANT_TO_DTYPE[normalized_variant]
-            if torch_dtype is None:
-                torch_dtype = variant_dtype
-                # Propagate the variant's dtype so the inner cast-on-read still
-                # produces the requested precision after a fallback.
-                dtype = variant_dtype
-            elif torch_dtype != variant_dtype:
-                raise ValueError(
-                    f"variant={normalized_variant!r} requires dtype={variant_dtype}; "
-                    f"got dtype={torch_dtype}. Drop dtype= to inherit from variant, "
-                    f"or unset variant= to load the default file."
-                )
+            # dtype-vs-variant consistency check MUST run before the probe.
+            # Otherwise, when the variant file is missing on the Hub,
+            # ``_resolve_variant`` downgrades to ``None`` and the inner
+            # ``from_pretrained``'s consistency check is skipped.
+            torch_dtype = BaseGLiNER._parse_dtype(dtype)
+            if normalized_variant is not None:
+                variant_dtype = BaseGLiNER._VARIANT_TO_DTYPE[normalized_variant]
+                if torch_dtype is None:
+                    torch_dtype = variant_dtype
+                    dtype = variant_dtype
+                elif torch_dtype != variant_dtype:
+                    raise ValueError(
+                        f"variant={normalized_variant!r} requires dtype={variant_dtype}; "
+                        f"got dtype={torch_dtype}. Drop dtype= to inherit from variant, "
+                        f"or unset variant= to load the default file."
+                    )
 
-        # Probe for availability and warn-and-fall-back to None if the variant
-        # file isn't published. The inner from_pretrained will see model_dir
-        # is already populated and skip its own probe — no double round-trip.
-        normalized_variant = BaseGLiNER._resolve_variant(
-            model_id,
-            normalized_variant,
-            revision=revision,
-            cache_dir=cache_dir,
-            token=token,
-            local_files_only=local_files_only,
-        )
+            # Probe for availability and warn-and-fall-back to None if the
+            # variant file isn't published.
+            normalized_variant = BaseGLiNER._resolve_variant(
+                model_id,
+                normalized_variant,
+                revision=revision,
+                cache_dir=cache_dir,
+                token=token,
+                local_files_only=local_files_only,
+            )
 
         model_dir = BaseGLiNER._download_model(
             model_id,
@@ -4829,9 +7114,7 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
         with open(config_file) as f:
             config_dict = json.load(f)
 
-        config_dict.pop("model_type", None)
-
-        config = GLiNERConfig(**config_dict)
+        config = cls._config_from_dict(config_dict)
 
         # Determine the appropriate class
         gliner_class = cls._get_gliner_class(config)
@@ -4863,25 +7146,28 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
             _attn_implementation=_attn_implementation,
             load_onnx_model=load_onnx_model,
             onnx_model_file=onnx_model_file,
+            runtime=normalized_runtime,
+            runtime_model_file=runtime_model_file,
+            runtime_options=runtime_options,
             **model_kwargs,
         )
 
     @classmethod
     def from_config(
         cls,
-        config: Union[GLiNERConfig, str, Path, dict],
-        cache_dir: Optional[Union[str, Path]] = None,
+        config: GLiNERConfig | str | Path | dict,
+        cache_dir: str | Path | None = None,
         load_tokenizer: bool = True,
         resize_token_embeddings: bool = True,
         backbone_from_pretrained: bool = True,
         compile_torch_model: bool = False,
-        quantize: Optional[str] = None,
+        quantize: str | None = None,
         map_location: str = "cpu",
         # Config overrides
-        max_length: Optional[int] = None,
-        max_width: Optional[int] = None,
-        post_fusion_schema: Optional[str] = None,
-        _attn_implementation: Optional[str] = None,
+        max_length: int | None = None,
+        max_width: int | None = None,
+        post_fusion_schema: str | None = None,
+        _attn_implementation: str | None = None,
         **model_kwargs,
     ):
         """Create a GLiNER model from configuration.
@@ -4917,11 +7203,15 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
             if config_path.exists():
                 with open(config_path) as f:
                     config_dict = json.load(f)
-                config_ = GLiNERConfig(**config_dict)
+                config_ = cls._config_from_dict(config_dict)
             else:
                 raise FileNotFoundError(f"Config file not found: {config}")
         elif isinstance(config, dict):
-            config_ = GLiNERConfig(**config)
+            config_ = cls._config_from_dict(config)
+        elif isinstance(config, BaseGLiNERConfig):
+            config_ = config
+        else:
+            raise TypeError(f"config must be a GLiNERConfig object, path to config file, or dict. Got {type(config)}")
 
         # Determine the appropriate class
         gliner_class = cls._get_gliner_class(config_)
@@ -4951,6 +7241,11 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
             Dictionary mapping model types to their classes and descriptions.
         """
         return {
+            "gliner_streaming_span": {
+                "class": StreamingSpanGLiNER,
+                "description": "Streaming span NER with a causal decoder backbone",
+                "config": {"model_type": "gliner_streaming_span", "model_name": "required"},
+            },
             "gliner_uni_encoder_span": {
                 "class": UniEncoderSpanGLiNER,
                 "description": "Standard span-based NER with single encoder",
@@ -5031,6 +7326,7 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
             "UniEncoderTokenDecoderGLiNER": "gliner_uni_encoder_token_decoder",
             "UniEncoderSpanRelexGLiNER": "gliner_uni_encoder_span_relex",
             "UniEncoderTokenRelexGLiNER": "gliner_uni_encoder_token_relex",
+            "StreamingSpanGLiNER": "gliner_streaming_span",
         }
 
         return type_mapping.get(class_name, "unknown")

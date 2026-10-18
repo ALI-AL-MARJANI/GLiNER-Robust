@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional
+from typing import List
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 import torch
@@ -39,10 +39,10 @@ class GLiNERClassifier(GLiNERBasePipeline):
 
     def __init__(
         self,
-        model_id: Optional[str] = None,
-        model: Optional[GLiNER] = None,
+        model_id: str | None = None,
+        model: GLiNER | None = None,
         device: str = "cuda:0",
-        prompt: Optional[str] = None,
+        prompt: str | None = None,
     ):
         """
         Initializes the GLiNERClassifier.
@@ -171,9 +171,9 @@ class GLiNERClassifier(GLiNERBasePipeline):
 
     def evaluate(
         self,
-        dataset_id: Optional[str] = None,
-        dataset: Optional[Dataset] = None,
-        labels: Optional[List[str]] = None,
+        dataset_id: str | None = None,
+        dataset: Dataset | None = None,
+        labels: List[str] | None = None,
         threshold: float = 0.5,
         max_examples: float = -1,
     ):
@@ -193,10 +193,10 @@ class GLiNERClassifier(GLiNERBasePipeline):
         Raises:
             ValueError: If neither `dataset_id` nor `dataset` is provided.
         """
-        if dataset is None and dataset_id is not None:
+        if dataset is None:
+            if dataset_id is None:
+                raise ValueError("Either 'dataset_id' or 'dataset' must be provided to start evaluation.")
             dataset = load_dataset(dataset_id)
-        else:
-            raise ValueError("Either 'dataset_id' or 'dataset' must be provided to start evaluation.")
 
         test_texts, classes, true_labels = self.prepare_dataset(dataset, labels, max_examples=max_examples)
 
