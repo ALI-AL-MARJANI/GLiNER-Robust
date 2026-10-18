@@ -16,6 +16,7 @@ training
 architectures
 add_custom_architecture
 Runtime export and inference <convert_to_onnx>
+vocab_pruning
 serving
 ```
 
