@@ -12,7 +12,7 @@
 trained on that type: this is *zero-shot* NER. This fork adds two training losses, an evaluation setup over 8
 datasets, and a benchmark of 6 ways to run the model on a CPU.
 
-## In short
+## At a glance
 
 | | |
 |:---:|:---|
@@ -27,7 +27,7 @@ datasets, and a benchmark of 6 ways to run the model on a CPU.
 
 ---
 
-## How it started
+## 1,124 wrong answers for every right one
 
 GLiNER kept missing rare entities, and the loss looked like a suspect. A span model scores every span of 1 to 12 words
 against every entity type, so almost every (span, type) pair is a negative. Counting them with
@@ -53,7 +53,7 @@ Dice loss and span-width weighting were then written into the package, with test
 exactly. On the way, an upstream bug was fixed: `BiEncoderSpanModel` passed `label_smoothing` into the `prob_margin`
 argument.
 
-## A trustworthy baseline first
+## Trust the baseline before the loss
 
 Before comparing losses, the baseline had to be trustworthy:
 
@@ -64,7 +64,7 @@ The base model (`gliner_small-v2.5`) averages **57.59 F1**. Its errors are telli
 recall 64.5, because the model tags common nouns like "soldier" or "army" that annotators left out. Vague types score
 badly: `miscellaneous` reaches 11.8 F1 on CrossNER AI.
 
-## The bug that blocked OpenVINO
+## Six `If` nodes that never fire
 
 Exporting the model to OpenVINO failed: the ONNX graph had six `If` nodes from DeBERTa's position code, and OpenVINO's
 CPU plugin refused them ("If operation with dynamic rank"). In GLiNER, attention is always self-attention, so that
@@ -88,20 +88,20 @@ outputs (max difference 0.0), and a test checks it on a tiny random DeBERTa.
 - **OpenVINO static INT8** (weights and activations) collapses to 0.68 F1. Keeping the heads, the LSTM and the
   scoring step in FP32 doesn't fix it.
 
-## What didn't work
+## Open problems
 
 - **The first loss ablation**, withdrawn (see above).
 - **OpenVINO static INT8**: the cause of the collapse is still unknown.
 - **OpenVINO on an M4**: 2.1× slower than PyTorch at 64 words, even when lossless.
 
-## Lessons
+## Before believing a one-point gain
 
 - **Count the imbalance before changing the loss.** The 1,124 came from a script, not a guess.
 - **Identical scores are a red flag.** Check that the change actually ran, in the logs.
 - **One seed can't support a one-point gain.**
 - **Compare an exported model output by output**, before looking at F1.
 
-## Next
+## The ablation, finally
 
 - Run the full loss ablation: 7 variants × 5 seeds, fine-tuned on CoNLL-2003, scored on the 8 datasets. The code and
   configs are ready.
