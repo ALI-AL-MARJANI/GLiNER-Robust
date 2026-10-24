@@ -1,211 +1,114 @@
+<div align="center">
+
 # GLiNER-Robust
 
-A fork of [GLiNER](https://github.com/urchade/GLiNER) that adds span-level losses for the extreme negative/positive imbalance of span-based NER, a multi-seed zero-shot evaluation harness, and a measured CPU deployment comparison (PyTorch, ONNX Runtime, OpenVINO).
+**A fork of GLiNER that tests whether imbalance losses help zero-shot NER,<br>and what quantization really costs on a CPU.**
 
-## TL;DR
+</div>
 
-**Zero-shot entity-level micro-F1 of the base checkpoint**, measured with this repository's harness (`results/zero_shot/gliner_community_gliner_small_v2.5.json`):
+---
 
-| Dataset (test) | Sentences | F1 (%) | 95% CI (bootstrap) |
-|---|---:|---:|---|
-| WNUT-17 | 1,287 | 46.65 | [44.00, 49.25] |
-| CrossNER AI | 431 | 52.18 | [49.03, 55.25] |
-| CrossNER literature | 416 | 63.67 | [61.36, 65.94] |
-| CrossNER music | 465 | 74.90 | [72.88, 76.94] |
-| CrossNER politics | 651 | 64.51 | [62.20, 66.71] |
-| CrossNER science | 543 | 64.11 | [61.37, 66.76] |
-| MIT Movie | 2,443 | 53.92 | [52.59, 55.27] |
-| MIT Restaurant | 1,521 | 40.77 | [38.98, 42.56] |
-| **Average (8 zero-shot sets)** | | **57.59** | |
-| CoNLL-2003 (in-domain for the ablation, not zero-shot) | 3,453 | 62.77 | [61.37, 64.16] |
+**GLiNER** finds entities of any type you name ("person", "programming language", "dish") in text, without being
+trained on that type: this is *zero-shot* NER. This fork adds two training losses, an evaluation setup over 8
+datasets, and a benchmark of 6 ways to run the model on a CPU.
 
-Setup: `gliner-community/gliner_small-v2.5` @ `f227d3c`, no fine-tuning, threshold 0.5, flat NER, Apple M4 CPU (env block in the JSON). Deterministic inference, single run; intervals come from resampling test sentences.
+## In short
 
-**CPU deployment of the same checkpoint** (`results/deploy/apple-m4/summary.md`, generated from `results.json`):
+| | |
+|:---:|:---|
+| **1,124** | Wrong candidates scored for every correct entity on WNUT-17. That imbalance is why imbalance losses were tried. |
+| **BCE in disguise** | The first "Dice" results were plain BCE runs: the Dice option didn't exist yet. They were withdrawn. |
+| **1.62×**<br>faster | ONNX Runtime INT8 at 64 words, 3.4× smaller, for −2.29 F1. |
+| **0.68**<br>F1 | What OpenVINO's static INT8 leaves of a 57.59 F1 model. Root cause still unknown. |
 
-| Backend | Size (MB) | Avg F1, 8 sets (%) | ΔF1 vs PyTorch [95% CI] | p50 latency, 64 words, batch 1 (ms) |
-|---|---:|---:|---|---:|
-| PyTorch FP32 | 633 | 57.59 | — | 41.3 |
-| ONNX Runtime INT8 dynamic | 188 | 55.30 | −2.29 [−2.94, −1.66] | 25.6 (1.62× faster) |
-| OpenVINO INT8 weight-only | 188 | 57.54 | −0.05 [−0.16, +0.05] | 87.6 (2.1× slower) |
-| OpenVINO INT8 static (W+A) | 178 | 0.68 | −56.91 | 60.4 |
+<p align="center">
+  <img src="assets/span_imbalance.png" alt="Negatives per positive span by dataset" width="90%">
+</p>
 
-Setup: Apple M4 (16 GB), 4 threads, 10 warmup + 50 timed end-to-end calls; all six backends and input lengths in [CPU deployment](#cpu-deployment).
+---
 
-| Study | Status |
-|---|---|
-| Loss ablation (7 variants × 5 seeds, fine-tune on CoNLL-2003, evaluate on the 8 sets above) | **TBD (run pending)**. Code, config and statistics are in place; see [RUNBOOK.md](RUNBOOK.md#2-loss-ablation). |
-| CPU deployment on an Intel CPU (OpenVINO's target hardware) | **TBD (run pending)**. See [RUNBOOK.md](RUNBOOK.md#3-cpu-deployment-benchmark). |
+## How it started
 
-## What this fork adds
+GLiNER kept missing rare entities, and the loss looked like a suspect. A span model scores every span of 1 to 12 words
+against every entity type, so almost every (span, type) pair is a negative. Counting them with
+`scripts/span_imbalance.py` gave 283 negatives per positive on the CoNLL-2003 training set and 1,124 on WNUT-17.
 
-Everything else is upstream GLiNER at commit `dfc0061` (see `git log`).
+With **BCE** (binary cross-entropy, a yes/no score for each pair), most of the training signal goes to easy negatives.
+Two losses are built for this: **focal loss** turns down the weight of easy examples, and **Dice loss** scores the
+overlap between predicted and true entities, so easy negatives barely count.
 
-| Path | Content |
-|---|---|
-| `gliner/modeling/loss_functions.py` | `span_dice_loss` (self-adjusting Dice, Li et al. 2020), `span_width_weights`, `apply_positive_weights` |
-| `gliner/modeling/base.py` | `BaseModel._span_loss`: shared span loss for `UniEncoderSpanModel` and `BiEncoderSpanModel`, with `loss_type`, Dice and width-weighting options. Also fixes an upstream bug where `BiEncoderSpanModel.loss` passed `label_smoothing` positionally into `prob_margin`. |
-| `gliner/training/trainer.py` | `TrainingArguments.loss_type / dice_alpha / dice_smooth / use_span_width_weight` (defaults reproduce upstream exactly); the trainer refuses these options for model types that would silently ignore them |
-| `experiments/` | Dataset download with pinned revisions and SHA-256 checks, BIO parsing, entity-level F1, bootstrap / paired bootstrap / Holm correction, run metadata, deployment backends |
-| `scripts/` | `eval_zero_shot.py`, `span_imbalance.py`, `train_ablation.py`, `analyze_ablation.py`, `bench_deploy.py`, `analyze_deploy.py`, `error_examples.py`, `make_figures.py` |
-| `configs/experiments/` | `ablation.yaml`, `deploy.yaml`: every hyperparameter used by the scripts |
-| `tests/test_span_losses.py`, `tests/test_experiments.py`, `tests/test_deploy.py` | 35 fast tests (CPU, no download) |
-| `results/` | Raw JSON outputs; figures are generated from them by `scripts/make_figures.py` |
+## The first results were BCE in disguise
 
-## Motivation
+The first check: GLiNER's focal loss defaults (α = −1, γ = 0) make it exactly BCE, so "focal" had never really been
+on. Then came a first ablation table, where Dice and Dice + width weighting gave exactly the same score.
 
-A span model with maximum width K = 12 scores every span of 1–12 words against every prompted entity type, and almost all of these pairs are negatives (`results/span_imbalance.json`, `scripts/span_imbalance.py`):
+> Identical to the second decimal was too clean to be true.
 
-| Dataset | Split | Types | Gold entities | Candidate (span, type) pairs | Negatives per positive |
-|---|---|---:|---:|---:|---:|
-| CoNLL-2003 | train | 4 | 23,429 | 6,655,148 | 283 |
-| WNUT-17 | test | 6 | 1,079 | 1,211,826 | 1,124 |
-| CrossNER science | test | 17 | 3,089 | 3,366,340 | 1,089 |
-| MIT Restaurant | test | 8 | 3,151 | 647,544 | 205 |
+The training script passed `loss_type` and `use_span_width_weight` to options that didn't exist, and the package had
+no Dice loss at all. The logs of both "Dice" runs showed identical loss curves, on the scale of a summed BCE, while a
+Dice loss stays between 0 and 1. They were BCE runs, with 1 seed, 200 steps and one test set. The whole table was
+withdrawn ([`docs/devlog.md`](docs/devlog.md)).
 
-Losses designed for class imbalance (focal, Dice) are a natural candidate. The question this repository tests is whether they change zero-shot transfer after fine-tuning, measured with enough seeds to tell a real effect from noise.
+Dice loss and span-width weighting were then written into the package, with tests. The defaults reproduce upstream
+exactly. On the way, an upstream bug was fixed: `BiEncoderSpanModel` passed `label_smoothing` into the `prob_margin`
+argument.
 
-## Method
+## A trustworthy baseline first
 
-**BCE / focal** (upstream, Lin et al. 2017). Per (span, type) pair with probability *p* and label *y*:
-`FL = −α_t (1 − p_t)^γ log p_t`. With `focal_loss_alpha=-1, focal_loss_gamma=0` it is exactly BCE (tested in `tests/test_span_losses.py`).
+Before comparing losses, the baseline had to be trustworthy:
 
-**Self-adjusting Dice** (`span_dice_loss`, Li et al. 2020). Set-level over all valid pairs of the batch, as in the authors' implementation:
+- 8 zero-shot datasets (5 CrossNER domains, MIT Movie, MIT Restaurant, WNUT-17), pinned with checksums.
+- Entity-level F1 identical to GLiNER's own evaluator, with 95% intervals from 10,000 bootstrap resamples.
 
-```
-p~   = (1 − p)^α · p
-loss = 1 − (2 Σ w·p~·y + s) / (Σ w·p~ + Σ w·y + s)
-```
+The base model (`gliner_small-v2.5`) averages **57.59 F1**. Its errors are telling: on WNUT-17, precision is 36.5 and
+recall 64.5, because the model tags common nouns like "soldier" or "army" that annotators left out. Vague types score
+badly: `miscellaneous` reaches 11.8 F1 on CrossNER AI.
 
-Padded spans and padded entity types are excluded through `w` (tested). Deviations from the reference: no OHEM; Dice is not combined with the GLiNER negative-type sub-sampling (`negatives`, `masking` apply to BCE/focal only).
+## The bug that blocked OpenVINO
 
-**Span-width weighting** (`use_span_width_weight`). Positive pairs of width *k* words are weighted by `1 + ln k`; negatives keep weight 1. This is a heuristic of this repository, not a published method: long entities are rarer, and up-weighting all long spans would mostly up-weight negatives.
+Exporting the model to OpenVINO failed: the ONNX graph had six `If` nodes from DeBERTa's position code, and OpenVINO's
+CPU plugin refused them ("If operation with dynamic rank"). In GLiNER, attention is always self-attention, so that
+branch is never taken.
 
-**Threshold.** Dice does not produce calibrated probabilities, so every ablation run reports two results: GLiNER's default threshold 0.5, and a threshold picked on CoNLL-2003 dev from {0.2, …, 0.8}.
+The fix replaces the helper with its taken branch, during export only. The patched and original graphs give identical
+outputs (max difference 0.0), and a test checks it on a tiny random DeBERTa.
 
-**OpenVINO export.** The ONNX graph exported by upstream GLiNER contains six `If` nodes coming from DeBERTa-v2's `@torch.jit.script` `build_rpos` in `transformers`. The OpenVINO CPU plugin refuses to compile them ("If operation with dynamic rank"). In GLiNER's encoder, attention is always self-attention, so the branch is never taken. `experiments.deploy.traceable_deberta_rpos` replaces the helper with its taken branch during export only. On the real model, the patched and original ONNX graphs give identical logits (max abs difference 0.0 on a probe batch). `tests/test_deploy.py` checks the same property on a random tiny DeBERTa-v2 with a different input shape than the export.
+---
 
-## Experimental protocol
+## Same model, six ways to run it
 
-**Data.** Original distributions, pinned (commit or SHA-256) in `experiments/data.py`, downloaded on first use into `data/raw/`:
+<p align="center">
+  <img src="assets/deploy.png" alt="F1 vs latency for six CPU backends" width="90%">
+</p>
 
-| Dataset | Source | Test sentences / entities | Types |
-|---|---|---:|---:|
-| CoNLL-2003 (train 14,041 / dev 3,250 / test 3,453) | CrossNER repository copy | 3,453 / 5,628 | 4 |
-| CrossNER AI, literature, music, politics, science | [zliucr/CrossNER](https://github.com/zliucr/CrossNER) @ `2e7ba2a` | 431–651 / 1,809–4,209 | 9–17 |
-| MIT Movie (`engtest.bio`), MIT Restaurant | [MIT CSAIL SLS](https://groups.csail.mit.edu/sls/downloads/) | 2,443 / 5,339 and 1,521 / 3,151 | 12, 8 |
-| WNUT-17 | [leondz/emerging_entities_17](https://github.com/leondz/emerging_entities_17) @ `e52a2d2` | 1,287 / 1,079 | 6 |
+- **ONNX Runtime INT8** is the only backend faster than PyTorch at every input length: 2.84× at 16 words, 1.62× at
+  64. It is 3.4× smaller and costs 2.29 F1, unevenly across datasets.
+- **OpenVINO INT8 weights only** loses nothing (−0.05 F1, the interval includes 0), but every OpenVINO backend is slower
+  than PyTorch on Apple silicon. OpenVINO is built for Intel CPUs, so this says nothing about them.
+- **OpenVINO static INT8** (weights and activations) collapses to 0.68 F1. Keeping the heads, the LSTM and the
+  scoring step in FP32 doesn't fix it.
 
-Entity types are prompted as natural-language names (e.g. `programlang` → "programming language"). The mapping is defined in `experiments/data.py`.
+## What didn't work
 
-**Metric.** Entity-level micro-F1 with exact match on start, end and type. It is computed from per-sentence (TP, #pred, #gold) counts, and the result is identical to `gliner.evaluation.BaseNEREvaluator` (unit test, and checked on real predictions). For a single run, a 95% interval comes from 10,000 bootstrap resamples of test sentences. Method comparisons use a paired bootstrap over sentences that keeps all seeds, stratified by dataset for the average, with Holm–Bonferroni correction across variants.
+- **The first loss ablation**, withdrawn (see above).
+- **OpenVINO static INT8**: the cause of the collapse is still unknown.
+- **OpenVINO on an M4**: 2.1× slower than PyTorch at 64 words, even when lossless.
 
-**Ablation** (`configs/experiments/ablation.yaml`):
-- Base checkpoint: `gliner_small-v2.5` @ `f227d3c`.
-- Training: fine-tuning on the full CoNLL-2003 train split for 2,000 steps at batch 8. Optimizer values follow upstream `configs/config_span.yaml`.
-- Selection: the checkpoint is chosen on 1,000 CoNLL-2003 dev sentences every 500 steps.
-- Variants:
-  - `bce` (baseline);
-  - `bce_width`;
-  - `focal_a025`, `focal_a050`, `focal_a075` (γ = 2);
-  - `dice`;
-  - `dice_width`.
-- Seeds: 0–4.
-- Evaluation: CoNLL-2003 test plus the 8 zero-shot sets. Rare-type F1 is the macro-F1 over types that make up less than 5% of a test set's gold entities.
+## Lessons
 
-**Deployment** (`configs/experiments/deploy.yaml`):
-- Backends: PyTorch FP32, ONNX Runtime FP32, ONNX Runtime dynamic INT8 (upstream `export_to_onnx(quantize=True)`), OpenVINO FP32, OpenVINO INT8 weight-only (`nncf.compress_weights`, INT8_ASYM), and OpenVINO static INT8 (`nncf.quantize`, weights and activations, 300 CoNLL-2003 dev calibration sentences).
-- Pipeline: the same GLiNER pre-processing and decoding for every backend.
-- Measurements: F1 on the 8 zero-shot sets; end-to-end latency with 10 warmup calls and 50 timed calls, inputs of 16 / 64 / 256 words at batch 1 and 8, 4 threads, reporting p50 / p90 / mean ± std; size on disk; and the max |Δp| from PyTorch on a probe batch.
+- **Count the imbalance before changing the loss.** The 1,124 came from a script, not a guess.
+- **Identical scores are a red flag.** Check that the change actually ran, in the logs.
+- **One seed can't support a one-point gain.**
+- **Compare an exported model output by output**, before looking at F1.
 
-## Results
+## Next
 
-### Zero-shot baseline
+- Run the full loss ablation: 7 variants × 5 seeds, fine-tuned on CoNLL-2003, scored on the 8 datasets. The code and
+  configs are ready.
+- Run static INT8 and OpenVINO on an Intel CPU, the hardware it targets.
+- A per-type F1 breakdown, to see whether the losses help rare types.
 
-See the TL;DR table. For context only, the GLiNER paper reports these numbers for its own checkpoints. They are not comparable with ours: the checkpoints differ (paper v1 models), the label strings differ (the paper uses the InstructUIE/UniNER JSON release), and WNUT-17 is not in the paper's table.
+---
 
-| Paper (Zaratiana et al., 2024), Table 1 | Movie | Restaurant | AI | Literature | Music | Politics | Science | Avg |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| GLiNER-S (50M) | 46.9 | 33.3 | 50.7 | 60.0 | 60.9 | 61.5 | 55.6 | 52.7 |
-| GLiNER-L (0.3B) | 57.2 | 42.9 | 57.2 | 64.4 | 69.6 | 72.6 | 62.6 | 60.9 |
-
-**Error analysis.** Per-type scores are in the result JSON. Concrete failures come from `scripts/error_examples.py` and are stored in `results/zero_shot/error_examples.json`.
-
-- **Precision, not recall, limits WNUT-17.** P = 36.5 and R = 64.5. The model tags common nouns that the WNUT guidelines leave unannotated, such as "soldier" [person], "Police" [group] and "army" [group].
-- **Tokenization artifacts in CrossNER.** Plurals are split ("naive Bayes classifier s"). The model includes the stray "s" and loses the exact match: "Gaussian mixture model s" is predicted where the gold entity is "Gaussian mixture model".
-- **Vague types.** `miscellaneous` reaches 11.8 F1 on CrossNER AI and `task` reaches 26.3. On MIT Movie, `review` is at 5.5, `plot` at 13.2 and `title` at 25.1, while `actor` and `director` exceed 82. Annotation conventions also cost exact matches: "right now" is gold [year], and the gold for "1980s action movies" is "action", not "action movies".
-
-### Loss ablation
-
-TBD (run pending). `scripts/analyze_ablation.py` will write `results/ablation/summary.md` (mean ± std over seeds, Δ vs `bce` with 95% CI and Holm-corrected p), and `scripts/make_figures.py` will draw `results/figures/ablation_zero_shot.png`. A result where no variant beats BCE significantly will be reported as such.
-
-### CPU deployment
-
-Apple M4, 16 GB, 4 threads, `gliner_small-v2.5` (`results/deploy/apple-m4/summary.md`). p50 end-to-end latency in ms (collate + forward + decode), with the speed-up relative to PyTorch FP32 in parentheses. Inputs have exactly N words; "b" is the batch size. ΔF1 is the difference of the 8-dataset average F1 from PyTorch, with a paired bootstrap 95% CI over test sentences.
-
-| Backend | Size (MB) | Avg F1 (%) | ΔF1 [95% CI] | 16 w, b1 | 16 w, b8 | 64 w, b1 | 64 w, b8 | 256 w, b1 | 256 w, b8 |
-|---|---:|---:|---|---:|---:|---:|---:|---:|---:|
-| pytorch_fp32 | 633 | 57.59 | — | 26.2 | 88.0 | 41.3 | 219.8 | 115.5 | 1188.3 |
-| onnx_fp32 | 634 | 57.59 | +0.00 [+0.00, +0.01] | 19.1 (1.37×) | 117.4 (0.75×) | 41.5 (1.00×) | 295.6 (0.74×) | 136.1 (0.85×) | 1372.5 (0.87×) |
-| onnx_int8_dynamic | 188 | 55.30 | −2.29 [−2.94, −1.66] | 9.2 (2.84×) | 69.2 (1.27×) | 25.6 (1.62×) | 197.6 (1.11×) | 94.0 (1.23×) | 1043.9 (1.14×) |
-| openvino_fp32 | 650 | 57.59 | +0.01 [−0.01, +0.03] | 31.6 (0.83×) | 201.2 (0.44×) | 89.0 (0.46×) | 665.0 (0.33×) | 348.7 (0.33×) | 3162.1 (0.38×) |
-| openvino_int8_weights | 188 | 57.54 | −0.05 [−0.16, +0.05] | 30.8 (0.85×) | 199.3 (0.44×) | 87.6 (0.47×) | 632.0 (0.35×) | 335.5 (0.34×) | 3148.3 (0.38×) |
-| openvino_int8_static | 178 | 0.68 | −56.91 [−57.72, −56.11] | 18.0 (1.45×) | 102.4 (0.86×) | 60.4 (0.68×) | 405.2 (0.54×) | 452.9 (0.26×) | 3644.1 (0.33×) |
-
-![Accuracy vs latency](results/figures/deploy_pareto_apple-m4.png)
-
-**Analysis.**
-
-- **Export correctness.** After the export fix, the FP32 backends (ONNX Runtime, OpenVINO) reproduce PyTorch: average F1 is identical to 0.01 points.
-- **ONNX Runtime dynamic INT8** is the only backend that is faster than PyTorch at every input length on this machine: 2.84× at 16 words and 1.62× at 64 words, falling to 1.1–1.3× at 256 words or batch 8, where non-quantized operations dominate. It is also 3.4× smaller. It costs 2.29 F1 points on average, and the loss is significant. The loss is uneven across datasets: in the per-dataset results (`results.json`), MIT Restaurant and MIT Movie drop by about 9 and 7 points, while CrossNER politics gains about 4.
-- **OpenVINO weight-only INT8** (`nncf.compress_weights`) is 3.4× smaller with no measurable F1 change (CI includes 0). On Apple silicon, however, every OpenVINO backend is slower than PyTorch: 1.2× slower at 16 words and 2.1–3× slower at 64 words and above. OpenVINO's CPU plugin is optimized for x86, so this result says nothing about Intel CPUs.
-- **OpenVINO static INT8** (`nncf.quantize`, weights and activations) collapses: predicted span probabilities differ from PyTorch by up to 1.0. Keeping the span/prompt heads, the LSTM and the scoring einsum in FP32 does not fix it (`RUNBOOK.md`). The root cause is not established.
-- **Batching.** With ONNX Runtime FP32, batch 8 is slower than PyTorch, while batch 1 at short inputs is faster. For short single queries, ONNX Runtime's lower per-call overhead matters most.
-
-## Limitations and threats to validity
-
-- **One checkpoint, one size.** The ablation fine-tunes a single small model on a single source dataset (CoNLL-2003). It says nothing about training from scratch on Pile-NER as in the paper, or about larger backbones.
-- **Fine-tuning on CoNLL-2003 can reduce zero-shot F1 relative to the base checkpoint**, whatever the loss. The base-checkpoint row above is the reference for that effect.
-- **Label verbalization is ours.** Changing a prompt string (e.g. "miscellaneous") changes F1. Absolute numbers are therefore not comparable to published tables.
-- **Selection uses CoNLL-2003 dev only.** No target-domain data is used for checkpoint or threshold selection. That is the intended zero-shot setting, but the selected threshold may be far from optimal on a target domain.
-- **Scale of the losses.** Upstream sums BCE over pairs (`loss_reduction: sum`), whereas Dice lies in [0, 1]. With AdamW and gradient clipping at 10 the effective step size differs between variants. No per-variant learning-rate search was run.
-- **Latency.** Results apply to the measured CPU only (Apple M4). OpenVINO is designed for Intel CPUs, so these numbers say nothing about OpenVINO on x86. Latency is the median of 50 calls in a single session, which does not capture run-to-run variance across reboots.
-
-## Reproduce
-
-Commands, expected run time and hardware for every table are in [RUNBOOK.md](RUNBOOK.md):
-- **Zero-shot baseline:** about 10 minutes on an Apple M4 CPU.
-- **Loss ablation:** 35 fine-tuning runs, GPU recommended.
-- **CPU benchmark:** 44 minutes on an Apple M4.
-
-```bash
-uv sync --extra experiments --extra training --group dev   # Python >= 3.11
-uv run pytest -q
-```
-
-## Using GLiNER itself
-
-Installation, inference API, training and ONNX conversion are unchanged from upstream: see the [upstream README](https://github.com/urchade/GLiNER) and `docs/`. The losses added here are opt-in training arguments:
-
-```python
-from gliner.training import TrainingArguments
-
-args = TrainingArguments(output_dir="out", loss_type="dice", dice_alpha=1.0, use_span_width_weight=True)
-```
-
-## References
-
-- Zaratiana, Tomeh, Holat, Charnois. *GLiNER: Generalist Model for Named Entity Recognition using Bidirectional Transformer.* NAACL 2024. [arXiv:2311.08526](https://arxiv.org/abs/2311.08526), [code](https://github.com/urchade/GLiNER)
-- Lin, Goyal, Girshick, He, Dollár. *Focal Loss for Dense Object Detection.* ICCV 2017. [arXiv:1708.02002](https://arxiv.org/abs/1708.02002)
-- Li, Sun, Meng, Liang, Wu, Li. *Dice Loss for Data-imbalanced NLP Tasks.* ACL 2020. [arXiv:1911.02855](https://arxiv.org/abs/1911.02855), [code](https://github.com/ShannonAI/dice_loss_for_NLP)
-- Liu et al. *CrossNER: Evaluating Cross-Domain Named Entity Recognition.* AAAI 2021. [arXiv:2012.04373](https://arxiv.org/abs/2012.04373), [data](https://github.com/zliucr/CrossNER)
-- Liu, Pasupat, Cyphers, Glass. *ASGARD: A Portable Architecture for Multilingual Dialogue Systems.* ICASSP 2013 (MIT Movie / Restaurant). [data](https://groups.csail.mit.edu/sls/downloads/)
-- Derczynski, Nichols, van Erp, Limsopatham. *Results of the WNUT2017 Shared Task on Novel and Emerging Entity Recognition.* W-NUT 2017. [data](https://github.com/leondz/emerging_entities_17)
-- He, Gao, Chen. *DeBERTaV3.* ICLR 2023. [arXiv:2111.09543](https://arxiv.org/abs/2111.09543)
-- OpenVINO weight compression and post-training quantization: [docs](https://docs.openvino.ai/), [NNCF](https://github.com/openvinotoolkit/nncf)
-- ONNX Runtime quantization: [docs](https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html)
-- Efron, Tibshirani. *An Introduction to the Bootstrap.* 1993. Koehn. *Statistical Significance Tests for Machine Translation Evaluation.* EMNLP 2004 (paired bootstrap).
-
-## License
-
-Apache-2.0, inherited from upstream GLiNER (`LICENSE`). The added code is released under the same license.
+<sub>All numbers come from files in `results/`; [RUNBOOK.md](RUNBOOK.md) regenerates them. Fork of
+[GLiNER](https://github.com/urchade/GLiNER), Apache-2.0 (`LICENSE`).</sub>
